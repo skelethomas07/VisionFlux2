@@ -27,7 +27,7 @@ from services.notifications import (
 )
 from ui.figures import (
     build_distribution_figure,
-    build_fiber_direction_figure,
+    build_direction_segment_figure,
     build_orientation_histogram,
     build_orientation_rose,
 )
@@ -258,7 +258,7 @@ def _sidebar() -> None:
 
     recipient = st.sidebar.text_input(
         "완료 알림 이메일",
-        placeholder="your-email@gmail.com",
+        placeholder="name@example.com",
         help="주소를 입력하면 모든 이미지 분석이 끝난 뒤 한 번만 완료 메일을 보냅니다. 비워 두면 발송하지 않습니다.",
     ).strip()
 
@@ -489,7 +489,15 @@ def _orientation_tab(item: ReviewItem) -> None:
         st.info("방향 결과가 없습니다. 이미지를 다시 분석해 주세요.")
         return
     representative_lines = build_representative_lines(item.measurements, item.representatives)
-    m1, m2, m3 = st.columns(3)
+    status = (
+        item.measurements["status"].astype(str)
+        if "status" in item.measurements.columns
+        else pd.Series("active", index=item.measurements.index)
+    )
+    active = item.measurements[status.isin(["active", "accepted"])]
+    path_count = int(active["fiber_path_id"].nunique()) if "fiber_path_id" in active.columns else 0
+    segment_count = int(active[["fiber_path_id", "direction_segment_id"]].drop_duplicates().shape[0]) if {"fiber_path_id", "direction_segment_id"}.issubset(active.columns) else 0
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric(
         "주방향",
         "—" if not np.isfinite(orientation.dominant_direction_deg) else f"{orientation.dominant_direction_deg:+.1f}°",
@@ -501,9 +509,14 @@ def _orientation_tab(item: ReviewItem) -> None:
         help="0은 방향이 고르게 퍼진 상태, 1은 거의 한 방향으로 정렬된 상태입니다.",
     )
     m3.metric(
-        "방향 분석 면적",
-        f"{100 * orientation.gated_fraction:.1f}%",
-        help="방향 신뢰도와 구조 에너지 기준을 통과해 통계에 사용된 픽셀 비율입니다.",
+        "검출 경로",
+        path_count,
+        help="Centerline graph에서 분리된 연속 fiber 경로 수입니다. 교차점에서는 경로가 나뉠 수 있습니다.",
+    )
+    m4.metric(
+        "방향 구간",
+        segment_count,
+        help="긴 fiber가 휘어 방향이 지속적으로 달라지면 같은 경로 안에서 여러 방향 구간으로 나눕니다.",
     )
 
     st.caption(
@@ -527,7 +540,7 @@ def _orientation_tab(item: ReviewItem) -> None:
         config={"displayModeBar": False},
     )
     st.plotly_chart(
-        build_fiber_direction_figure(representative_lines),
+        build_direction_segment_figure(item.measurements),
         use_container_width=True,
         config={"displayModeBar": False},
     )

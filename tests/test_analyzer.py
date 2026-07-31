@@ -65,29 +65,37 @@ def test_merge_orientation_measurements_adds_rescue_rows_with_review_schema():
 
 def test_run_uploaded_analysis_emits_monotonic_stage_progress(monkeypatch):
     import pipeline.analyzer as analyzer
+    from pipeline.fast_detector import FastDetectionResult
+    from pipeline.orientation import analyze_orientation
 
     local = pd.DataFrame([
-        dict(fiber_region_id=1, region_sample_index=0, width_px=4.0,
+        dict(fiber_region_id=1, fiber_path_id=1, direction_segment_id=0,
+             region_sample_index=0, width_px=4.0, sample_length_px=7.0,
              center_x=4.0, center_y=4.0, x1=4.0, y1=2.0, x2=4.0, y2=6.0,
-             confidence=0.8),
+             confidence=0.8, grade="A", detector="test"),
     ])
     regions = pd.DataFrame([dict(fiber_region_id=1, median_width_px=4.0)])
     reps = pd.DataFrame([dict(fiber_region_id=1, subregion_id=1,
                               representative_width_px=4.0, fiber_count_weight=1.0)])
     candidates = pd.DataFrame()
     image = np.zeros((16, 16), np.float32)
+    orientation = analyze_orientation(image, sigma_px=2.0, prefer_gpu=False)
 
+    def fake_detector(image, prefer_gpu, progress_callback):
+        progress_callback(0.1, "feature")
+        progress_callback(0.8, "measure")
+        return FastDetectionResult(
+            local.copy(), regions.copy(), reps.copy(), candidates.copy(), orientation,
+            np.zeros_like(image, bool), np.zeros_like(image), np.ones_like(image),
+            {"algorithm": "fast_direction_graph_v1"},
+        )
+
+    monkeypatch.setattr(analyzer, "detect_fibers_fast", fake_detector)
     monkeypatch.setattr(
         analyzer.legacy_pipeline,
         "process_one",
-        lambda path: ({"ok": True}, local.copy(), regions.copy(), reps.copy(), candidates.copy()),
+        lambda path: (_ for _ in ()).throw(AssertionError("legacy must not run")),
     )
-    monkeypatch.setattr(
-        analyzer.legacy_pipeline,
-        "prepare_image",
-        lambda path: (image.copy(), None),
-    )
-    monkeypatch.setattr(analyzer, "orientation_guided_rescue", lambda *args, **kwargs: pd.DataFrame())
 
     events = []
     result = analyzer.run_uploaded_analysis(
@@ -102,5 +110,7 @@ def test_run_uploaded_analysis_emits_monotonic_stage_progress(monkeypatch):
     assert fractions[0] == 0.0
     assert fractions[-1] == 1.0
     assert fractions == sorted(fractions)
-    assert len(events) >= 7
+    assert len(events) >= 6
     assert result.summary["compute_backend"] == "CPU"
+    assert result.summary["algorithm"] == "fast_direction_graph_v1"
+    assert result.summary["legacy_fallback_used"] is False

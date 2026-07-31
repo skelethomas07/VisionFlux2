@@ -257,3 +257,46 @@ def build_fiber_direction_figure(representative_lines: list[dict]) -> go.Figure:
         showlegend=False,
     )
     return fig
+
+
+def build_direction_segment_figure(measurements: pd.DataFrame, bins: int = 36) -> go.Figure:
+    """Length-weighted direction distribution from local fiber path segments.
+
+    A long curved fiber contributes its local directions along the path instead of
+    being forced into one representative angle. Rejected/corrected rows are excluded.
+    """
+    fig = go.Figure()
+    if measurements is None or measurements.empty or "direction_deg" not in measurements.columns:
+        fig.update_layout(title="Fiber 방향 구간 데이터가 없습니다", height=360)
+        return fig
+    active = measurements.copy()
+    if "status" in active.columns:
+        active = active[active["status"].astype(str).isin(["active", "accepted"])]
+    directions = pd.to_numeric(active["direction_deg"], errors="coerce").to_numpy(float)
+    if "sample_length_px" in active.columns:
+        weights = pd.to_numeric(active["sample_length_px"], errors="coerce").fillna(0).to_numpy(float)
+    else:
+        weights = np.ones(len(active), dtype=float)
+    good = np.isfinite(directions) & np.isfinite(weights) & (weights > 0)
+    directions, weights = directions[good], weights[good]
+    if not len(directions):
+        fig.update_layout(title="Fiber 방향 구간 데이터가 없습니다", height=360)
+        return fig
+    hist, edges = np.histogram(directions, bins=int(bins), range=(-90, 90), weights=weights)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    fig.add_trace(go.Bar(
+        x=centers,
+        y=hist,
+        marker_color=[_orientation_color(a) for a in centers],
+        hovertemplate="방향 %{x:.1f}°<br>구간 길이 %{y:.1f} px<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Fiber 국소 방향 분포",
+        xaxis_title="fiber 방향 (°)",
+        yaxis_title="검출된 구간 길이 (px)",
+        xaxis={"range": [-90, 90], "tickvals": [-90, -45, 0, 45, 90]},
+        height=360,
+        margin={"l": 45, "r": 20, "t": 55, "b": 45},
+        showlegend=False,
+    )
+    return fig

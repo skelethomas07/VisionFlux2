@@ -14,6 +14,7 @@ from skimage.transform import resize
 import tifffile
 
 from pipeline import legacy_pipeline
+from pipeline.fast_detector import FastDetectionResult, detect_fibers_fast
 from pipeline.orientation import (
     OrientationResult,
     analyze_orientation,
@@ -201,6 +202,30 @@ def _emit_progress(
         callback(float(min(1.0, max(0.0, fraction))), str(message))
 
 
+def _run_legacy_fallback(
+    decoded: DecodedImage,
+    filename: str,
+    nm_per_px: float | None,
+) -> tuple[dict, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, np.ndarray, bytes | None]:
+    """Run the previous detector only when explicitly requested as an emergency fallback."""
+    with tempfile.TemporaryDirectory(prefix="sem-fiber-legacy-") as tmp:
+        root = Path(tmp)
+        image_path = root / f"{_safe_stem(filename)}_analysis.tif"
+        output_dir = root / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tifffile.imwrite(image_path, decoded.image.astype(np.float32))
+        legacy_pipeline.OUTPUT_DIR = output_dir
+        legacy_pipeline.SHOW_INLINE = False
+        legacy_pipeline.NM_PER_PX = {}
+        if nm_per_px is not None:
+            legacy_pipeline.NM_PER_PX[image_path.name] = float(nm_per_px) / decoded.analysis_scale
+        summary, local, regions, reps, candidates = legacy_pipeline.process_one(image_path)
+        analysis_img, _ = legacy_pipeline.prepare_image(image_path)
+        diagnostic_path = output_dir / f"{image_path.stem}_fiber_regions_sem_refined.png"
+        diagnostic = diagnostic_path.read_bytes() if diagnostic_path.exists() else None
+    return summary, local, regions, reps, candidates, analysis_img, diagnostic
+
+
 def run_uploaded_analysis(
     data: bytes,
     filename: str,
@@ -209,59 +234,58 @@ def run_uploaded_analysis(
     *,
     prefer_gpu: bool = True,
     progress_callback: Callable[[float, str], None] | None = None,
+    fallback_to_legacy: bool = False,
 ) -> AnalysisResult:
+    """Analyze one uploaded SEM image with the fast direction-graph detector.
+
+    The structure tensor, ridge maps, pore mask, centerline paths, and normal edge
+    profiles are each computed once. The old beam-search pipeline remains available
+    only through ``fallback_to_legacy=True``.
+    """
     _emit_progress(progress_callback, 0.0, "이미지 읽는 중")
     decoded = decode_and_scale_image(data, filename, max_dimension=max_dimension)
+    analysis_img = decoded.image.astype(np.float32, copy=False)
     _emit_progress(progress_callback, 0.06, "분석 이미지 준비")
-    with tempfile.TemporaryDirectory(prefix="sem-fiber-") as tmp:
-        root = Path(tmp)
-        image_path = root / f"{_safe_stem(filename)}_analysis.tif"
-        output_dir = root / "output"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        tifffile.imwrite(image_path, decoded.image.astype(np.float32))
 
-        legacy_pipeline.OUTPUT_DIR = output_dir
-        legacy_pipeline.SHOW_INLINE = False
-        legacy_pipeline.NM_PER_PX = {}
-        if nm_per_px is not None:
-            legacy_pipeline.NM_PER_PX[image_path.name] = float(nm_per_px) / decoded.analysis_scale
+    def detector_progress(fraction: float, message: str) -> None:
+        _emit_progress(progress_callback, 0.08 + 0.84 * float(fraction), message)
 
-        _emit_progress(progress_callback, 0.12, "Fiber 후보와 두께 추적 중")
-        summary, local, regions, reps, candidates = legacy_pipeline.process_one(image_path)
-        _emit_progress(progress_callback, 0.68, "자동 두께 결과 정리")
-        analysis_img, _ = legacy_pipeline.prepare_image(image_path)
-        local, regions, reps = normalize_analysis_tables(
-            local, regions, reps, decoded.analysis_scale, nm_per_px,
+    diagnostic = None
+    used_legacy = False
+    try:
+        fast: FastDetectionResult = detect_fibers_fast(
+            analysis_img,
+            prefer_gpu=prefer_gpu,
+            progress_callback=detector_progress,
         )
-        _emit_progress(progress_callback, 0.76, "방향 tensor 계산 중")
+        summary = dict(fast.summary)
+        local = fast.measurements
+        regions = fast.regions
+        reps = fast.representatives
+        candidates = fast.candidates
+        orientation = fast.orientation
+    except Exception:
+        if not fallback_to_legacy:
+            raise
+        used_legacy = True
+        _emit_progress(progress_callback, 0.10, "고속 검출 실패 · 기존 검출기로 전환")
+        summary, local, regions, reps, candidates, analysis_img, diagnostic = _run_legacy_fallback(
+            decoded, filename, nm_per_px,
+        )
         orientation = analyze_orientation(
             analysis_img,
             sigma_px=4.0,
             prefer_gpu=prefer_gpu,
         )
-        _emit_progress(progress_callback, 0.88, "두께와 방향 정보 결합")
-        local = annotate_measurement_directions(local, orientation)
-        try:
-            _emit_progress(progress_callback, 0.91, "누락 fiber 보완 후보 탐색")
-            rescue = orientation_guided_rescue(
-                analysis_img,
-                orientation,
-                existing_measurements=local,
-                sample_spacing_px=8.0,
-                max_candidates=700,
-            )
-        except Exception:
-            rescue = pd.DataFrame()
-        local = merge_orientation_measurements(
-            local, rescue, decoded.analysis_scale, nm_per_px,
-        )
-        _emit_progress(progress_callback, 0.97, "결과 저장 준비")
-        diagnostic_path = output_dir / f"{image_path.stem}_fiber_regions_sem_refined.png"
-        diagnostic = diagnostic_path.read_bytes() if diagnostic_path.exists() else None
+
+    _emit_progress(progress_callback, 0.93, "두께와 방향 결과 정리")
+    local, regions, reps = normalize_analysis_tables(
+        local, regions, reps, decoded.analysis_scale, nm_per_px,
+    )
+    local = annotate_measurement_directions(local, orientation)
 
     summary = dict(summary)
     summary.update(orientation_summary_dict(orientation))
-    summary["orientation_rescue_measurements"] = int(len(rescue))
     summary.update(
         uploaded_filename=filename,
         original_height=decoded.original_shape[0],
@@ -270,6 +294,7 @@ def run_uploaded_analysis(
         nm_per_original_px=nm_per_px,
         analysis_height=int(analysis_img.shape[0]),
         analysis_width=int(analysis_img.shape[1]),
+        legacy_fallback_used=bool(used_legacy),
     )
     result = AnalysisResult(
         image=_display_uint8(analysis_img),

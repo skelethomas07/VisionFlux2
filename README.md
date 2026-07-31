@@ -183,3 +183,19 @@ VisionFlux/
 ## 성능 참고
 
 Streamlit Community Cloud에서는 `빠름 · 최대 1200 px` 설정을 권장합니다. 분석 결과는 축소된 분석 이미지에서 계산되더라도 원본 픽셀 크기로 환산됩니다. 동일한 이미지와 설정은 Streamlit 캐시를 사용해 불필요한 재계산을 줄입니다.
+
+## Fast direction-graph detector
+
+The default detector is now `fast_direction_graph_v1`.
+
+- Computes the structure tensor only once.
+- Computes a six-scale bright-ridge map once and reuses it.
+- Builds a conservative dark pore-core mask before centerline tracing.
+- Converts the ridge skeleton into local paths instead of running the previous beam search.
+- Measures all path-normal edge profiles in vectorized batches.
+- Keeps one curved path while splitting its local direction into persistent direction segments.
+- Weights the fiber-direction chart by detected segment length, so a curved fiber is not forced into one angle.
+
+`pipeline/legacy_pipeline.py` is still included for emergency compatibility, but the Streamlit app does not call it during normal analysis. The new detector runs on CPU in Streamlit Community Cloud. On a local CUDA/CuPy environment, both the structure tensor and multiscale Hessian ridge calculations use the GPU.
+
+The detector is intentionally high-recall. Low-confidence edge or pore-crossing candidates are excluded, and the remaining false positives can still be removed with the existing eraser tool.

@@ -25,3 +25,17 @@ def test_orientation_figures_build_from_analysis_result():
     rose = build_orientation_rose(result)
     assert len(histogram.data) >= 1
     assert len(rose.data) >= 1
+
+
+def test_direction_segment_figure_uses_length_weighted_local_directions():
+    from ui.figures import build_direction_segment_figure
+
+    measurements = pd.DataFrame([
+        {"direction_deg": 5.0, "sample_length_px": 20.0, "status": "active", "fiber_path_id": 1, "direction_segment_id": 0},
+        {"direction_deg": 25.0, "sample_length_px": 5.0, "status": "active", "fiber_path_id": 1, "direction_segment_id": 1},
+        {"direction_deg": -40.0, "sample_length_px": 100.0, "status": "rejected", "fiber_path_id": 2, "direction_segment_id": 0},
+    ])
+    fig = build_direction_segment_figure(measurements)
+    assert len(fig.data) == 1
+    assert float(np.sum(fig.data[0].y)) == 25.0
+    assert "구간 길이" in fig.layout.yaxis.title.text
