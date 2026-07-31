@@ -258,7 +258,7 @@ def _sidebar() -> None:
 
     recipient = st.sidebar.text_input(
         "완료 알림 이메일",
-        placeholder="skelethomas07@gmail.com",
+        placeholder="your-email@gmail.com",
         help="주소를 입력하면 모든 이미지 분석이 끝난 뒤 한 번만 완료 메일을 보냅니다. 비워 두면 발송하지 않습니다.",
     ).strip()
 
