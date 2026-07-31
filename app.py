@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import time
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from pipeline.analyzer import AnalysisResult, run_uploaded_analysis
+from pipeline.batch import BatchInput, BatchProgress, format_elapsed, run_batch
+from pipeline.compute import detect_compute_backend
 from pipeline.review import (
     apply_canvas_edits,
     build_representative_lines,
     build_session_zip,
-    recompute_representatives,
+)
+from pipeline.review_state import ReviewItem, build_review_item, recompute_review_item
+from services.notifications import (
+    CompletionReport,
+    EmailConfig,
+    send_completion_email,
+    validate_email_address,
 )
 from ui.figures import (
     build_distribution_figure,
@@ -21,67 +31,52 @@ from ui.figures import (
     build_orientation_histogram,
     build_orientation_rose,
 )
+from ui.live_timer import live_elapsed_timer
 from ui.measurement_canvas import measurement_canvas, normalize_canvas_payload
 
 SUPPORTED_TYPES = ["tif", "tiff", "png", "jpg", "jpeg", "bmp"]
 
 
-@st.cache_data(max_entries=3, show_spinner=False)
+@st.cache_data(max_entries=12, show_spinner=False)
 def _cached_analysis(
     image_bytes: bytes,
     filename: str,
     nm_per_px: float | None,
     max_dimension: int | None,
+    prefer_gpu: bool,
+    _progress_callback=None,
 ) -> AnalysisResult:
     return run_uploaded_analysis(
         image_bytes,
         filename,
         nm_per_px=nm_per_px,
         max_dimension=max_dimension,
+        prefer_gpu=prefer_gpu,
+        progress_callback=_progress_callback,
     )
 
 
 def _init_state() -> None:
     defaults = {
-        "analysis": None,
-        "measurements": pd.DataFrame(),
-        "representatives": pd.DataFrame(),
-        "feedback": [],
-        "revision": 0,
-        "upload_digest": None,
-        "nm_per_px": None,
-        "last_apply_token": None,
+        "batch_items": {},
+        "selected_item_id": None,
+        "last_batch_report": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
 
-def _recompute() -> None:
-    analysis = st.session_state.analysis
-    if analysis is None:
-        st.session_state.representatives = pd.DataFrame()
-        return
-    st.session_state.representatives = recompute_representatives(
-        st.session_state.measurements,
-        analysis_scale=analysis.analysis_scale,
-        nm_per_px=st.session_state.nm_per_px,
-    )
-
-
-def _run_analysis(uploaded, nm_per_px: float | None, max_dimension: int | None) -> None:
-    image_bytes = uploaded.getvalue()
-    digest = hashlib.sha256(image_bytes).hexdigest()
-    with st.spinner("두께와 방향을 분석하고 있습니다. 이미지 크기에 따라 잠시 걸릴 수 있습니다."):
-        result = _cached_analysis(image_bytes, uploaded.name, nm_per_px, max_dimension)
-    st.session_state.analysis = result
-    st.session_state.measurements = result.measurements.copy(deep=True)
-    st.session_state.feedback = []
-    st.session_state.revision += 1
-    st.session_state.upload_digest = digest
-    st.session_state.nm_per_px = nm_per_px
-    st.session_state.last_apply_token = None
-    _recompute()
+def _current_item() -> ReviewItem | None:
+    items: dict[str, ReviewItem] = st.session_state.batch_items
+    selected = st.session_state.selected_item_id
+    if selected in items:
+        return items[selected]
+    if items:
+        selected = next(iter(items))
+        st.session_state.selected_item_id = selected
+        return items[selected]
+    return None
 
 
 def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
@@ -95,18 +90,182 @@ def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return float(values[order][np.searchsorted(cumulative, 0.5 * cumulative[-1])])
 
 
+def _secret_section(name: str) -> dict:
+    try:
+        section = st.secrets[name]
+        return dict(section)
+    except Exception:
+        return {}
+
+
+def _email_config() -> EmailConfig | None:
+    values = _secret_section("email")
+    sender = str(values.get("sender", "")).strip()
+    password = str(values.get("app_password", "")).strip()
+    if not sender or not password:
+        return None
+    return EmailConfig(
+        sender=sender,
+        app_password=password,
+        smtp_host=str(values.get("smtp_host", "smtp.gmail.com")),
+        smtp_port=int(values.get("smtp_port", 465)),
+        timeout_seconds=float(values.get("timeout_seconds", 20.0)),
+    )
+
+
+def _app_url() -> str | None:
+    value = str(_secret_section("app").get("url", "")).strip()
+    return value or None
+
+
+def _make_batch_inputs(uploaded_files) -> list[BatchInput]:
+    items: list[BatchInput] = []
+    used: set[str] = set()
+    for index, uploaded in enumerate(uploaded_files):
+        data = uploaded.getvalue()
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        item_id = digest
+        suffix = 1
+        while item_id in used:
+            suffix += 1
+            item_id = f"{digest}-{suffix}"
+        used.add(item_id)
+        items.append(BatchInput(item_id=item_id, filename=uploaded.name, data=data))
+    return items
+
+
+def _send_batch_email(
+    recipient: str,
+    *,
+    total: int,
+    succeeded: int,
+    failed_names: list[str],
+    elapsed_seconds: float,
+) -> tuple[str, str | None]:
+    if not recipient:
+        return "not_requested", None
+    config = _email_config()
+    if config is None:
+        return "not_configured", "Streamlit Secrets에 발신 Gmail 설정이 없습니다."
+    report = CompletionReport(
+        total_files=total,
+        succeeded_files=succeeded,
+        failed_files=len(failed_names),
+        elapsed_seconds=elapsed_seconds,
+        completed_at=datetime.now(timezone.utc),
+        failed_filenames=tuple(failed_names),
+        app_url=_app_url(),
+    )
+    try:
+        send_completion_email(config, recipient, report)
+        return "sent", None
+    except Exception as exc:
+        return "failed", f"{type(exc).__name__}: {exc}"
+
+
+def _run_batch_analysis(
+    uploaded_files,
+    nm_per_px: float | None,
+    max_dimension: int | None,
+    prefer_gpu: bool,
+    recipient: str,
+) -> None:
+    batch_inputs = _make_batch_inputs(uploaded_files)
+    if not batch_inputs:
+        return
+
+    started_perf = time.perf_counter()
+    started_unix = time.time()
+    progress_bar = st.sidebar.progress(0, text="0% · 분석 준비")
+    stage_slot = st.sidebar.empty()
+    elapsed_slot = st.sidebar.empty()
+    with st.sidebar:
+        live_elapsed_timer(started_unix)
+
+    def on_progress(event: BatchProgress) -> None:
+        percent = int(round(100 * event.overall_fraction))
+        progress_bar.progress(
+            percent,
+            text=f"{percent}% · {event.file_index}/{event.total_files} · {event.message}",
+        )
+        stage_slot.caption(event.filename)
+        elapsed_slot.caption(f"서버 경과 시간 {format_elapsed(event.elapsed_seconds)}")
+
+    def analyze(item: BatchInput, report) -> AnalysisResult:
+        report(0.01, "캐시와 이미지 확인")
+        result = _cached_analysis(
+            item.data,
+            item.filename,
+            nm_per_px,
+            max_dimension,
+            prefer_gpu,
+            _progress_callback=report,
+        )
+        report(1.0, "결과 준비 완료")
+        return result
+
+    outcomes = run_batch(batch_inputs, analyze, on_progress=on_progress)
+    elapsed = time.perf_counter() - started_perf
+
+    review_items: dict[str, ReviewItem] = {}
+    failed_names: list[str] = []
+    errors: dict[str, str] = {}
+    for outcome in outcomes:
+        if outcome.result is None:
+            failed_names.append(outcome.filename)
+            errors[outcome.filename] = outcome.error or "알 수 없는 오류"
+            continue
+        review_items[outcome.item_id] = build_review_item(
+            outcome.item_id,
+            outcome.result,
+            nm_per_px=nm_per_px,
+            duration_seconds=outcome.duration_seconds,
+        )
+
+    email_status, email_error = _send_batch_email(
+        recipient,
+        total=len(outcomes),
+        succeeded=len(review_items),
+        failed_names=failed_names,
+        elapsed_seconds=elapsed,
+    )
+
+    st.session_state.batch_items = review_items
+    st.session_state.selected_item_id = next(iter(review_items), None)
+    st.session_state.last_batch_report = {
+        "total": len(outcomes),
+        "succeeded": len(review_items),
+        "failed": len(failed_names),
+        "failed_names": failed_names,
+        "errors": errors,
+        "elapsed_seconds": elapsed,
+        "email_recipient": recipient,
+        "email_status": email_status,
+        "email_error": email_error,
+        "requested_backend": "GPU" if prefer_gpu else "CPU",
+    }
+    st.session_state.pop("selected_result", None)
+
+
 def _sidebar() -> None:
     st.sidebar.markdown("## 분석")
-    uploaded = st.sidebar.file_uploader(
+    uploaded_files = st.sidebar.file_uploader(
         "SEM 이미지",
         type=SUPPORTED_TYPES,
-        help="TIFF, PNG, JPEG, BMP 파일 한 장을 올립니다.",
+        accept_multiple_files=True,
+        help="한 장 또는 여러 장을 한 번에 올릴 수 있습니다. 메모리 사용량을 줄이기 위해 순서대로 분석합니다.",
     )
+
+    recipient = st.sidebar.text_input(
+        "완료 알림 이메일",
+        placeholder="skelethomas07@gmail.com",
+        help="주소를 입력하면 모든 이미지 분석이 끝난 뒤 한 번만 완료 메일을 보냅니다. 비워 두면 발송하지 않습니다.",
+    ).strip()
 
     use_calibration = st.sidebar.toggle(
         "nm 단위 사용",
         value=False,
-        help="이미지의 원본 픽셀 크기(nm/px)를 알고 있을 때 켭니다.",
+        help="업로드한 이미지들이 같은 원본 픽셀 크기(nm/px)를 사용할 때 켭니다.",
     )
     nm_per_px = None
     if use_calibration:
@@ -118,12 +277,17 @@ def _sidebar() -> None:
             help="스케일 바 또는 촬영 조건에서 확인한 원본 이미지의 nm/px 값입니다.",
         )
 
-    with st.sidebar.expander("분석 해상도", expanded=False):
+    with st.sidebar.expander("분석 설정", expanded=False):
         resolution = st.radio(
             "처리 크기",
             ["빠름 · 최대 1200 px", "균형 · 최대 1600 px", "원본 · 로컬 권장"],
             index=0,
-            help="Cloud에서는 1200 px가 가장 안정적입니다. 결과 두께는 원본 픽셀 크기로 환산됩니다.",
+            help="Cloud에서는 1200 px가 가장 안정적입니다. 두께는 원본 픽셀 크기로 환산됩니다.",
+        )
+        prefer_gpu = st.toggle(
+            "가능하면 GPU 사용",
+            value=True,
+            help="로컬 CUDA/CuPy 환경에서는 방향 tensor 계산을 GPU로 처리합니다. 사용할 수 없으면 자동으로 CPU로 전환합니다.",
         )
     max_dimension = {
         "빠름 · 최대 1200 px": 1200,
@@ -131,78 +295,138 @@ def _sidebar() -> None:
         "원본 · 로컬 권장": None,
     }[resolution]
 
+    backend = detect_compute_backend(prefer_gpu=prefer_gpu)
+    if backend.gpu_available:
+        st.sidebar.caption(f"계산 장치: GPU · {backend.detail}")
+    else:
+        st.sidebar.caption(f"계산 장치: CPU · {backend.detail}")
+
+    analyze_disabled = not uploaded_files
     if st.sidebar.button(
         "분석 시작",
         type="primary",
         use_container_width=True,
-        disabled=uploaded is None,
-        help="Edge, ridge, OrientationJ 방향 정보와 원본 SEM 일치도를 함께 사용해 두께를 찾습니다.",
+        disabled=analyze_disabled,
+        help="업로드한 모든 이미지를 순서대로 분석합니다. 진행률과 경과 시간이 아래에 표시됩니다.",
     ):
+        if recipient:
+            try:
+                recipient = validate_email_address(recipient)
+            except ValueError as exc:
+                st.sidebar.error(str(exc))
+                return
         try:
-            _run_analysis(uploaded, nm_per_px, max_dimension)
+            _run_batch_analysis(
+                uploaded_files,
+                nm_per_px,
+                max_dimension,
+                prefer_gpu,
+                recipient,
+            )
             st.rerun()
         except Exception as exc:
-            st.sidebar.error(f"분석 중 오류가 발생했습니다: {type(exc).__name__}: {exc}")
+            st.sidebar.error(f"분석 실행 중 오류가 발생했습니다: {type(exc).__name__}: {exc}")
 
-    if st.session_state.analysis is not None:
+    items: dict[str, ReviewItem] = st.session_state.batch_items
+    if items:
         st.sidebar.divider()
+        ids = list(items)
+        current = st.session_state.selected_item_id
+        index = ids.index(current) if current in ids else 0
+        selected = st.sidebar.selectbox(
+            "검토할 이미지",
+            options=ids,
+            index=index,
+            format_func=lambda item_id: items[item_id].analysis.image_name,
+            key="selected_result",
+            help="여러 이미지를 분석했다면 여기서 한 장씩 선택해 두께를 수정합니다.",
+        )
+        st.session_state.selected_item_id = selected
         st.sidebar.caption(
             "노란 선은 자동 대표 두께, 하늘색 선은 방향 기반 보완, 청록 선은 사용자가 추가한 두께입니다."
         )
 
 
-def _summary_metrics() -> None:
-    reps = st.session_state.representatives
-    measurements = st.session_state.measurements
-    use_nm = st.session_state.nm_per_px is not None
+def _batch_report_banner() -> None:
+    report = st.session_state.last_batch_report
+    if not report:
+        return
+    text = (
+        f"{report['total']}개 분석 · 성공 {report['succeeded']}개 · "
+        f"실패 {report['failed']}개 · {format_elapsed(report['elapsed_seconds'])}"
+    )
+    if report["failed"]:
+        st.warning(text)
+        with st.expander("실패한 파일 확인", expanded=False):
+            for filename, error in report["errors"].items():
+                st.code(f"{filename}: {error}")
+    else:
+        st.success(text)
+
+    status = report.get("email_status")
+    if status == "sent":
+        st.caption(f"완료 알림을 {report['email_recipient']}로 보냈습니다.")
+    elif status == "not_configured":
+        st.info("분석 결과는 저장되었습니다. 완료 메일을 보내려면 Streamlit Secrets에 발신 Gmail을 설정하세요.")
+    elif status == "failed":
+        st.warning(f"분석은 완료됐지만 이메일 발송에 실패했습니다: {report.get('email_error')}")
+
+
+def _summary_metrics(item: ReviewItem) -> None:
+    reps = item.representatives
+    measurements = item.measurements
+    use_nm = item.nm_per_px is not None
     value_col = "representative_width_nm" if use_nm else "representative_width_original_px"
     values = pd.to_numeric(reps.get(value_col, pd.Series(dtype=float)), errors="coerce").to_numpy(float)
-    weights = pd.to_numeric(reps.get("fiber_count_weight", pd.Series(dtype=float)), errors="coerce").fillna(0).to_numpy(float)
+    weights = pd.to_numeric(
+        reps.get("fiber_count_weight", pd.Series(dtype=float)), errors="coerce"
+    ).fillna(0).to_numpy(float)
     median = _weighted_median(values, weights) if len(values) else float("nan")
     manual_count = int((measurements.get("source", pd.Series(dtype=str)).astype(str) == "manual").sum())
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("대표 두께 수", int(len(reps)), help="같은 fiber 영역에서 반복 측정된 값은 하나의 대표값으로 묶습니다.")
-    c2.metric(
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("선택 이미지", item.analysis.image_name, help="현재 두께와 방향 결과를 확인하고 있는 이미지입니다.")
+    c2.metric("대표 두께 수", int(len(reps)), help="같은 fiber 영역의 반복 측정은 대표값으로 묶습니다.")
+    c3.metric(
         "중앙 두께",
         "—" if not np.isfinite(median) else f"{median:.2f} {'nm' if use_nm else 'px'}",
         help="각 fiber 영역이 같은 총 가중치를 갖도록 계산한 중앙값입니다.",
     )
-    c3.metric("수동 추가", manual_count, help="사용자가 두 점 클릭으로 추가해 최종 반영한 두께선 수입니다.")
+    c4.metric("수동 추가", manual_count, help="두 점 클릭 후 전체 반영한 수동 두께선 수입니다.")
 
 
-def _handle_canvas_result(result) -> None:
+def _handle_canvas_result(result, item: ReviewItem) -> None:
     raw_payload = getattr(result, "apply", None) if result is not None else None
     if raw_payload is None:
         return
     payload = normalize_canvas_payload(raw_payload)
     if not payload["new_measurements"] and not payload["delete_ids"]:
         return
-    token = f"{st.session_state.revision}:" + json.dumps(payload, sort_keys=True)
-    if token == st.session_state.last_apply_token:
+    token = f"{item.revision}:" + json.dumps(payload, sort_keys=True)
+    if token == item.last_apply_token:
         return
     updated, events = apply_canvas_edits(
-        st.session_state.measurements,
+        item.measurements,
         payload["new_measurements"],
         payload["delete_ids"],
-        analysis_scale=st.session_state.analysis.analysis_scale,
-        nm_per_px=st.session_state.nm_per_px,
+        analysis_scale=item.analysis.analysis_scale,
+        nm_per_px=item.nm_per_px,
     )
-    st.session_state.measurements = updated
-    st.session_state.feedback.extend(events)
-    st.session_state.last_apply_token = token
-    st.session_state.revision += 1
-    _recompute()
+    item.measurements = updated
+    item.feedback.extend(events)
+    item.last_apply_token = token
+    item.revision += 1
+    recompute_review_item(item)
     st.toast(
         f"수동 측정 {len(payload['new_measurements'])}개 추가 · 기존 표시 {len(payload['delete_ids'])}개 수정"
     )
     st.rerun()
 
 
-def _thickness_tab() -> None:
-    analysis = st.session_state.analysis
-    reps = st.session_state.representatives
-    representative_lines = build_representative_lines(st.session_state.measurements, reps)
+def _thickness_tab(item: ReviewItem) -> None:
+    analysis = item.analysis
+    reps = item.representatives
+    representative_lines = build_representative_lines(item.measurements, reps)
 
     with st.expander("측정값 고치는 방법", expanded=False):
         st.markdown(
@@ -217,14 +441,14 @@ def _thickness_tab() -> None:
         analysis.image,
         representative_lines,
         analysis_scale=analysis.analysis_scale,
-        nm_per_px=st.session_state.nm_per_px,
-        revision=st.session_state.revision,
-        key=f"visionflux-canvas-{analysis.image_name}",
+        nm_per_px=item.nm_per_px,
+        revision=item.revision,
+        key=f"visionflux-canvas-{item.item_id}",
     )
-    _handle_canvas_result(canvas_result)
+    _handle_canvas_result(canvas_result, item)
 
     st.markdown("### 두께 분포")
-    use_nm = st.session_state.nm_per_px is not None
+    use_nm = item.nm_per_px is not None
     st.plotly_chart(
         build_distribution_figure(reps, use_nm=use_nm),
         use_container_width=True,
@@ -234,9 +458,9 @@ def _thickness_tab() -> None:
     stem = Path(analysis.image_name).stem
     zip_bytes = build_session_zip(
         analysis.image_name,
-        st.session_state.measurements,
+        item.measurements,
         reps,
-        st.session_state.feedback,
+        item.feedback,
         analysis_summary=analysis.summary,
     )
     d1, d2 = st.columns(2)
@@ -254,20 +478,17 @@ def _thickness_tab() -> None:
         file_name=f"{stem}_visionflux_review.zip",
         mime="application/zip",
         use_container_width=True,
-        help="수정된 전체 측정, 대표 두께, 사용자 수정 기록과 분석 요약을 함께 저장합니다.",
+        help="수정된 측정, 대표 두께, 수정 기록과 분석 요약을 함께 저장합니다.",
     )
 
 
-def _orientation_tab() -> None:
-    analysis = st.session_state.analysis
+def _orientation_tab(item: ReviewItem) -> None:
+    analysis = item.analysis
     orientation = analysis.orientation
     if orientation is None:
         st.info("방향 결과가 없습니다. 이미지를 다시 분석해 주세요.")
         return
-    representative_lines = build_representative_lines(
-        st.session_state.measurements,
-        st.session_state.representatives,
-    )
+    representative_lines = build_representative_lines(item.measurements, item.representatives)
     m1, m2, m3 = st.columns(3)
     m1.metric(
         "주방향",
@@ -285,15 +506,26 @@ def _orientation_tab() -> None:
         help="방향 신뢰도와 구조 에너지 기준을 통과해 통계에 사용된 픽셀 비율입니다.",
     )
 
-    st.caption("방향 기준: 0°는 수평, 양수는 화면에서 오른쪽으로 갈수록 위로 올라가는 방향입니다. Fiber 방향은 180° 주기입니다.")
+    st.caption(
+        f"계산 장치: {orientation.compute_backend} · {orientation.compute_backend_detail} · "
+        "0°는 수평이며 fiber 방향은 180° 주기입니다."
+    )
     st.image(
         orientation.color_map,
         caption="색상은 방향, 채도는 방향 신뢰도(coherency), 밝기는 원본 SEM 명암을 나타냅니다.",
         use_container_width=True,
     )
     c1, c2 = st.columns(2)
-    c1.plotly_chart(build_orientation_histogram(orientation), use_container_width=True, config={"displayModeBar": False})
-    c2.plotly_chart(build_orientation_rose(orientation), use_container_width=True, config={"displayModeBar": False})
+    c1.plotly_chart(
+        build_orientation_histogram(orientation),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
+    c2.plotly_chart(
+        build_orientation_rose(orientation),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
     st.plotly_chart(
         build_fiber_direction_figure(representative_lines),
         use_container_width=True,
@@ -312,19 +544,21 @@ def main() -> None:
 
     st.title("VisionFlux")
     st.markdown("#### Surface to Volume")
-    st.caption("SEM 한 장에서 fiber의 두께와 방향을 정리해, 3D 구조 생성에 사용할 입력 분포를 만듭니다.")
+    st.caption("SEM 이미지에서 fiber 두께와 방향을 정리해 3D 구조 생성에 사용할 입력 분포를 만듭니다.")
 
     _sidebar()
-    if st.session_state.analysis is None:
+    _batch_report_banner()
+    item = _current_item()
+    if item is None:
         st.info("왼쪽에서 SEM 이미지를 올린 뒤 **분석 시작**을 눌러 주세요.")
         return
 
-    _summary_metrics()
+    _summary_metrics(item)
     thickness_tab, orientation_tab = st.tabs(["두께", "방향"])
     with thickness_tab:
-        _thickness_tab()
+        _thickness_tab(item)
     with orientation_tab:
-        _orientation_tab()
+        _orientation_tab(item)
 
 
 if __name__ == "__main__":

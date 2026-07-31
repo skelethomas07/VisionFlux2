@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 import re
 import tempfile
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -191,13 +192,27 @@ def _display_uint8(image: np.ndarray) -> np.ndarray:
     return np.round(norm * 255).astype(np.uint8)
 
 
+def _emit_progress(
+    callback: Callable[[float, str], None] | None,
+    fraction: float,
+    message: str,
+) -> None:
+    if callback is not None:
+        callback(float(min(1.0, max(0.0, fraction))), str(message))
+
+
 def run_uploaded_analysis(
     data: bytes,
     filename: str,
     nm_per_px: float | None = None,
     max_dimension: int | None = 1600,
+    *,
+    prefer_gpu: bool = True,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> AnalysisResult:
+    _emit_progress(progress_callback, 0.0, "이미지 읽는 중")
     decoded = decode_and_scale_image(data, filename, max_dimension=max_dimension)
+    _emit_progress(progress_callback, 0.06, "분석 이미지 준비")
     with tempfile.TemporaryDirectory(prefix="sem-fiber-") as tmp:
         root = Path(tmp)
         image_path = root / f"{_safe_stem(filename)}_analysis.tif"
@@ -211,14 +226,23 @@ def run_uploaded_analysis(
         if nm_per_px is not None:
             legacy_pipeline.NM_PER_PX[image_path.name] = float(nm_per_px) / decoded.analysis_scale
 
+        _emit_progress(progress_callback, 0.12, "Fiber 후보와 두께 추적 중")
         summary, local, regions, reps, candidates = legacy_pipeline.process_one(image_path)
+        _emit_progress(progress_callback, 0.68, "자동 두께 결과 정리")
         analysis_img, _ = legacy_pipeline.prepare_image(image_path)
         local, regions, reps = normalize_analysis_tables(
             local, regions, reps, decoded.analysis_scale, nm_per_px,
         )
-        orientation = analyze_orientation(analysis_img, sigma_px=4.0)
+        _emit_progress(progress_callback, 0.76, "방향 tensor 계산 중")
+        orientation = analyze_orientation(
+            analysis_img,
+            sigma_px=4.0,
+            prefer_gpu=prefer_gpu,
+        )
+        _emit_progress(progress_callback, 0.88, "두께와 방향 정보 결합")
         local = annotate_measurement_directions(local, orientation)
         try:
+            _emit_progress(progress_callback, 0.91, "누락 fiber 보완 후보 탐색")
             rescue = orientation_guided_rescue(
                 analysis_img,
                 orientation,
@@ -231,6 +255,7 @@ def run_uploaded_analysis(
         local = merge_orientation_measurements(
             local, rescue, decoded.analysis_scale, nm_per_px,
         )
+        _emit_progress(progress_callback, 0.97, "결과 저장 준비")
         diagnostic_path = output_dir / f"{image_path.stem}_fiber_regions_sem_refined.png"
         diagnostic = diagnostic_path.read_bytes() if diagnostic_path.exists() else None
 
@@ -246,7 +271,7 @@ def run_uploaded_analysis(
         analysis_height=int(analysis_img.shape[0]),
         analysis_width=int(analysis_img.shape[1]),
     )
-    return AnalysisResult(
+    result = AnalysisResult(
         image=_display_uint8(analysis_img),
         image_name=filename,
         analysis_scale=decoded.analysis_scale,
@@ -259,3 +284,5 @@ def run_uploaded_analysis(
         diagnostic_png=diagnostic,
         orientation=orientation,
     )
+    _emit_progress(progress_callback, 1.0, "분석 완료")
+    return result

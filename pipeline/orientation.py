@@ -8,6 +8,8 @@ import pandas as pd
 from scipy import ndimage
 from skimage.color import hsv2rgb
 
+from pipeline.compute import compute_structure_tensor
+
 
 @dataclass(frozen=True)
 class OrientationResult:
@@ -23,6 +25,8 @@ class OrientationResult:
     order_parameter: float
     gated_fraction: float
     sigma_px: float
+    compute_backend: str
+    compute_backend_detail: str
 
 
 def wrap90(angle):
@@ -44,16 +48,22 @@ def _normalize_image(image: np.ndarray) -> np.ndarray:
     return np.clip((arr - lo) / max(float(hi - lo), 1e-9), 0.0, 1.0).astype(np.float32)
 
 
-def _structure_tensor(image: np.ndarray, sigma_px: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _structure_tensor(
+    image: np.ndarray,
+    sigma_px: float,
+    *,
+    prefer_gpu: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str, str]:
     img = _normalize_image(image)
     derivative_sigma = max(0.8, 0.45 * float(sigma_px))
-    gy = ndimage.gaussian_filter(img, derivative_sigma, order=(1, 0), mode="reflect")
-    gx = ndimage.gaussian_filter(img, derivative_sigma, order=(0, 1), mode="reflect")
     tensor_sigma = max(1.0, float(sigma_px))
-    jyy = ndimage.gaussian_filter(gy * gy, tensor_sigma, mode="reflect")
-    jxy = ndimage.gaussian_filter(gy * gx, tensor_sigma, mode="reflect")
-    jxx = ndimage.gaussian_filter(gx * gx, tensor_sigma, mode="reflect")
-    return jyy.astype(np.float32), jxy.astype(np.float32), jxx.astype(np.float32)
+    jyy, jxy, jxx, backend = compute_structure_tensor(
+        img,
+        derivative_sigma=derivative_sigma,
+        tensor_sigma=tensor_sigma,
+        prefer_gpu=prefer_gpu,
+    )
+    return jyy, jxy, jxx, backend.name, backend.detail
 
 
 def _axial_stats(theta: np.ndarray, weights: np.ndarray) -> tuple[float, float]:
@@ -76,9 +86,12 @@ def analyze_orientation(
     min_coherency: float = 0.20,
     min_energy_frac: float = 0.02,
     nbins: int = 180,
+    prefer_gpu: bool = True,
 ) -> OrientationResult:
     """Compute OrientationJ-compatible direction, coherency and weighted statistics."""
-    jyy, jxy, jxx = _structure_tensor(image, sigma_px)
+    jyy, jxy, jxx, compute_backend, compute_backend_detail = _structure_tensor(
+        image, sigma_px, prefer_gpu=prefer_gpu
+    )
     energy = (jxx + jyy).astype(np.float32)
     theta = np.rad2deg(0.5 * np.arctan2(2.0 * jxy, jyy - jxx)).astype(np.float32)
     coherency = np.clip(
@@ -137,6 +150,8 @@ def analyze_orientation(
         order_parameter=order_parameter,
         gated_fraction=float(gate.mean()),
         sigma_px=float(sigma_px),
+        compute_backend=compute_backend,
+        compute_backend_detail=compute_backend_detail,
     )
 
 
@@ -187,6 +202,8 @@ def orientation_summary_dict(result: OrientationResult) -> dict:
         "orientation_order_parameter": result.order_parameter,
         "orientation_gated_fraction": result.gated_fraction,
         "orientation_sigma_px": result.sigma_px,
+        "compute_backend": result.compute_backend,
+        "compute_backend_detail": result.compute_backend_detail,
     }
 
 

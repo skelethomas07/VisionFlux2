@@ -64,3 +64,9 @@ def test_orientation_guided_rescue_finds_distinct_bright_fibres():
     assert rescued.fiber_region_id.nunique() >= 3
     assert rescued.width_px.between(4.0, 14.0).mean() > 0.75
     assert np.nanmedian(np.abs(rescued.direction_deg)) < 8.0
+
+
+def test_orientation_reports_cpu_backend_when_gpu_is_disabled():
+    result = analyze_orientation(horizontal_fibres(32, 48), sigma_px=2.0, prefer_gpu=False)
+    assert result.compute_backend == "CPU"
+    assert result.compute_backend_detail
