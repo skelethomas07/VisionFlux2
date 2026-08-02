@@ -19,6 +19,10 @@ class ReviewItem:
     nm_per_px: float | None = None
     last_apply_token: str | None = None
     duration_seconds: float = 0.0
+    canvas_state: dict = field(default_factory=dict)
+    collaboration_image_id: str | None = None
+    collaboration_worker: str | None = None
+    collaboration_editable: bool = True
 
 
 def build_review_item(
@@ -38,6 +42,10 @@ def build_review_item(
         nm_per_px=nm_per_px,
         last_apply_token=None,
         duration_seconds=float(duration_seconds),
+        canvas_state={},
+        collaboration_image_id=None,
+        collaboration_worker=None,
+        collaboration_editable=True,
     )
     recompute_review_item(item)
     return item
