@@ -20,6 +20,13 @@ from pipeline.review import (
     build_session_zip,
 )
 from pipeline.review_state import ReviewItem, build_review_item, recompute_review_item
+from services.collaboration import (
+    CollaborationConfig,
+    SupabaseRepository,
+    apply_snapshot_to_item,
+    collaboration_enabled,
+    serialize_snapshot,
+)
 from services.notifications import (
     CompletionReport,
     EmailConfig,
@@ -31,6 +38,8 @@ from ui.figures import (
     build_direction_segment_figure,
     build_orientation_histogram,
     build_orientation_rose,
+    build_thickness_direction_3d,
+    build_thickness_direction_heatmap,
 )
 from ui.live_timer import live_elapsed_timer
 from ui.measurement_canvas import measurement_canvas, normalize_canvas_payload
@@ -64,6 +73,10 @@ def _init_state() -> None:
         "batch_items": {},
         "selected_item_id": None,
         "last_batch_report": None,
+        "collab_project": None,
+        "collab_images": [],
+        "collab_worker": "",
+        "collab_notice": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -99,6 +112,131 @@ def _secret_section(name: str) -> dict:
         return dict(section)
     except Exception:
         return {}
+
+
+def _collaboration_config() -> CollaborationConfig | None:
+    values = _secret_section("supabase")
+    if not collaboration_enabled(values):
+        return None
+    try:
+        return CollaborationConfig.from_mapping(values)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collaboration_repo() -> SupabaseRepository | None:
+    config = _collaboration_config()
+    if config is None:
+        return None
+    return SupabaseRepository(config)
+
+
+def _refresh_shared_images(repo: SupabaseRepository) -> list[dict]:
+    project = repo.ensure_project(name="VisionFlux Shared Review")
+    images = repo.list_images(project["id"])
+    st.session_state.collab_project = project
+    st.session_state.collab_images = images
+    return images
+
+
+def _load_shared_image(
+    repo: SupabaseRepository,
+    row: dict,
+    worker: str,
+    *,
+    max_dimension: int | None,
+    prefer_gpu: bool,
+) -> None:
+    if not worker.strip():
+        raise ValueError("공동 작업자 이름을 입력해 주세요.")
+    lock = repo.acquire_lock(str(row["id"]), worker.strip())
+    editable = bool(lock.get("acquired"))
+    image_bytes = repo.download_image(str(row["storage_path"]))
+    result = _cached_analysis(
+        image_bytes, str(row["image_name"]), None, max_dimension, prefer_gpu, True,
+    )
+    detected = result.summary.get("nm_per_original_px")
+    item_id = f"shared-{row['id']}"
+    item = build_review_item(
+        item_id, result,
+        nm_per_px=None if detected is None else float(detected),
+    )
+    snapshot_row = repo.load_snapshot(str(row["id"]))
+    if snapshot_row and snapshot_row.get("snapshot"):
+        item.canvas_state = apply_snapshot_to_item(item, snapshot_row["snapshot"])
+    item.collaboration_image_id = str(row["id"])
+    item.collaboration_worker = worker.strip()
+    item.collaboration_editable = editable
+    st.session_state.batch_items[item_id] = item
+    st.session_state.selected_item_id = item_id
+    if editable:
+        st.session_state.collab_notice = f"{row['image_name']} 편집 잠금을 획득했습니다."
+    else:
+        owner = lock.get("locked_by") or row.get("locked_by") or "다른 작업자"
+        st.session_state.collab_notice = f"{owner} 님이 작업 중이어서 읽기 전용으로 열었습니다."
+
+
+def _save_shared_item(
+    item: ReviewItem,
+    *,
+    status: str = "in_progress",
+    canvas_state: dict | None = None,
+) -> bool:
+    if not item.collaboration_image_id or not item.collaboration_worker:
+        return False
+    repo = _collaboration_repo()
+    if repo is None:
+        return False
+    state = dict(item.canvas_state or {})
+    if canvas_state:
+        state.update(canvas_state)
+    item.canvas_state = state
+    snapshot = serialize_snapshot(
+        item, worker_name=item.collaboration_worker, status=status, canvas_state=state,
+    )
+    repo.save_snapshot(
+        image_id=item.collaboration_image_id,
+        worker_name=item.collaboration_worker,
+        snapshot=snapshot,
+        status=status,
+    )
+    return True
+
+
+def _upload_shared_artifacts(item: ReviewItem, export, zip_bytes: bytes) -> None:
+    if not item.collaboration_image_id or not item.collaboration_worker:
+        return
+    repo = _collaboration_repo()
+    if repo is None:
+        raise RuntimeError("Supabase 설정을 읽지 못했습니다.")
+    stem = Path(item.analysis.image_name).stem
+    repo.upload_artifact(
+        image_id=item.collaboration_image_id, kind="imagej_csv",
+        filename=f"{stem}_ImageJ_results.csv",
+        data=export.imagej_table.to_csv(index=False).encode("utf-8-sig"),
+        content_type="text/csv", worker_name=item.collaboration_worker,
+    )
+    repo.upload_artifact(
+        image_id=item.collaboration_image_id, kind="direction_csv",
+        filename=f"{stem}_fiber_directions.csv",
+        data=export.direction_table.to_csv(index=False).encode("utf-8-sig"),
+        content_type="text/csv", worker_name=item.collaboration_worker,
+    )
+    repo.upload_artifact(
+        image_id=item.collaboration_image_id, kind="labeled_png",
+        filename=f"{stem}_labeled_thickness.png", data=export.annotated_labeled_png,
+        content_type="image/png", worker_name=item.collaboration_worker,
+    )
+    repo.upload_artifact(
+        image_id=item.collaboration_image_id, kind="unlabeled_png",
+        filename=f"{stem}_thickness.png", data=export.annotated_unlabeled_png,
+        content_type="image/png", worker_name=item.collaboration_worker,
+    )
+    repo.upload_artifact(
+        image_id=item.collaboration_image_id, kind="review_zip",
+        filename=f"{stem}_visionflux_review.zip", data=zip_bytes,
+        content_type="application/zip", worker_name=item.collaboration_worker,
+    )
 
 
 def _email_config() -> EmailConfig | None:
@@ -342,6 +480,60 @@ def _sidebar() -> None:
         except Exception as exc:
             st.sidebar.error(f"분석 실행 중 오류가 발생했습니다: {type(exc).__name__}: {exc}")
 
+    config = _collaboration_config()
+    with st.sidebar.expander("Supabase 공동 작업", expanded=config is not None):
+        if config is None:
+            st.caption("Streamlit Secrets에 [supabase] 설정을 추가하면 5명이 같은 이미지와 수정 결과를 공유할 수 있습니다.")
+        else:
+            worker = st.text_input(
+                "작업자 이름", value=st.session_state.collab_worker,
+                key="collab-worker-input", help="잠금과 수정 기록에 표시할 이름입니다.",
+            ).strip()
+            st.session_state.collab_worker = worker
+            try:
+                repo = _collaboration_repo()
+                if repo is None:
+                    raise RuntimeError("Supabase 설정을 읽지 못했습니다.")
+                if st.button("공유 목록 새로고침", use_container_width=True):
+                    _refresh_shared_images(repo)
+                if not st.session_state.collab_images:
+                    _refresh_shared_images(repo)
+                if uploaded_files and st.button(
+                    "업로드 파일을 공동 프로젝트에 추가", use_container_width=True,
+                    disabled=not worker, help="원본 이미지를 private Supabase Storage에 저장합니다.",
+                ):
+                    project = st.session_state.collab_project or repo.ensure_project(name="VisionFlux Shared Review")
+                    for uploaded in uploaded_files:
+                        repo.upload_image(
+                            project_uuid=project["id"], filename=uploaded.name,
+                            data=uploaded.getvalue(), uploaded_by=worker,
+                        )
+                    _refresh_shared_images(repo)
+                    st.success(f"{len(uploaded_files)}개 이미지를 공유했습니다.")
+                shared_images = list(st.session_state.collab_images or [])
+                if shared_images:
+                    options = {str(row["id"]): row for row in shared_images}
+                    selected_shared = st.selectbox(
+                        "공유 이미지", options=list(options),
+                        format_func=lambda image_id: (
+                            f"{options[image_id]['image_name']} · {options[image_id].get('status', 'pending')}"
+                            + (f" · {options[image_id].get('locked_by')} 작업중" if options[image_id].get('locked_by') else "")
+                        ),
+                    )
+                    if st.button(
+                        "공유 이미지 열기", use_container_width=True, disabled=not worker,
+                        help="비어 있거나 만료된 잠금을 획득합니다. 잠긴 이미지는 읽기 전용으로 열립니다.",
+                    ):
+                        _load_shared_image(
+                            repo, options[selected_shared], worker,
+                            max_dimension=max_dimension, prefer_gpu=prefer_gpu,
+                        )
+                        st.rerun()
+                else:
+                    st.caption("공유 이미지가 아직 없습니다.")
+            except Exception as exc:
+                st.warning(f"공동 작업 연결 오류: {type(exc).__name__}: {exc}")
+
     items: dict[str, ReviewItem] = st.session_state.batch_items
     if items:
         st.sidebar.divider()
@@ -486,30 +678,51 @@ def _summary_metrics(item: ReviewItem) -> None:
 
 
 def _handle_canvas_result(result, item: ReviewItem) -> None:
-    raw_payload = getattr(result, "apply", None) if result is not None else None
+    if result is None:
+        return
+
+    raw_autosave = getattr(result, "autosave", None)
+    if raw_autosave is not None:
+        autosave_payload = normalize_canvas_payload(raw_autosave)
+        token = json.dumps(autosave_payload, sort_keys=True, default=str)
+        token_key = f"autosave-token-{item.item_id}"
+        if token != st.session_state.get(token_key):
+            item.canvas_state = dict(autosave_payload.get("canvas_state", {}) or {})
+            if item.collaboration_image_id and item.collaboration_editable:
+                try:
+                    _save_shared_item(item, canvas_state=item.canvas_state)
+                    st.toast("공유 프로젝트에 5분 자동저장했습니다.")
+                except Exception as exc:
+                    st.warning(f"공유 자동저장 실패: {type(exc).__name__}: {exc}")
+            st.session_state[token_key] = token
+
+    raw_payload = getattr(result, "apply", None)
     if raw_payload is None:
         return
     payload = normalize_canvas_payload(raw_payload)
     if not payload["new_measurements"] and not payload["delete_ids"]:
         return
-    token = f"{item.revision}:" + json.dumps(payload, sort_keys=True)
+    token = f"{item.revision}:" + json.dumps(payload, sort_keys=True, default=str)
     if token == item.last_apply_token:
         return
     updated, events = apply_canvas_edits(
-        item.measurements,
-        payload["new_measurements"],
-        payload["delete_ids"],
-        analysis_scale=item.analysis.analysis_scale,
-        nm_per_px=item.nm_per_px,
+        item.measurements, payload["new_measurements"], payload["delete_ids"],
+        analysis_scale=item.analysis.analysis_scale, nm_per_px=item.nm_per_px,
     )
     item.measurements = updated
     item.feedback.extend(events)
     item.last_apply_token = token
     item.revision += 1
+    state = dict(payload.get("canvas_state", {}) or {})
+    state.update({"revision": item.revision, "pending": [], "delete_ids": [], "savedAt": int(time.time() * 1000)})
+    item.canvas_state = state
     recompute_review_item(item)
-    st.toast(
-        f"수동 측정 {len(payload['new_measurements'])}개 추가 · 기존 표시 {len(payload['delete_ids'])}개 수정"
-    )
+    if item.collaboration_image_id and item.collaboration_editable:
+        try:
+            _save_shared_item(item, canvas_state=state)
+        except Exception as exc:
+            st.warning(f"공유 저장 실패: {type(exc).__name__}: {exc}")
+    st.toast(f"수동 측정 {len(payload['new_measurements'])}개 추가·수정 · 기존 표시 {len(payload['delete_ids'])}개 삭제")
     st.rerun()
 
 
@@ -521,9 +734,10 @@ def _thickness_tab(item: ReviewItem) -> None:
     with st.expander("측정값 고치는 방법", expanded=False):
         st.markdown(
             """
-1. 마우스 휠로 확대하고 **이동** 도구로 원하는 위치를 찾습니다.  
-2. **두께 추가**에서 fiber의 양쪽 edge를 차례로 클릭합니다. 여러 곳을 계속 표시할 수 있습니다.  
-3. 잘못된 선은 **지우개**로 선택한 뒤 **전체 반영**을 누릅니다.
+1. 마우스 휠로 확대하고 **이동·선택**으로 원하는 위치를 찾습니다.  
+2. **두께 추가**에서 edge 위에 1.5초 머물면 모델이 검출한 fiber 경로만 강조됩니다. 첫 edge를 클릭하면 가능한 경우 법선이 표시됩니다.  
+3. **두께 수정**에서 기존 선의 한쪽 끝을 클릭하면 같은 방향의 안내선이 표시됩니다. 새 edge를 클릭해 교체합니다.  
+4. 잘못된 선은 **지우개**로 선택한 뒤 **전체 반영**을 누릅니다.
             """
         )
 
@@ -535,6 +749,9 @@ def _thickness_tab(item: ReviewItem) -> None:
         revision=item.revision,
         key=f"visionflux-canvas-{item.item_id}",
         autosave_key=f"{item.item_id}-{analysis.image_name}",
+        initial_state=item.canvas_state,
+        editable=item.collaboration_editable,
+        hover_delay_ms=1500,
     )
     _handle_canvas_result(canvas_result, item)
 
@@ -570,38 +787,64 @@ def _thickness_tab(item: ReviewItem) -> None:
         analysis_summary=analysis.summary,
         imagej_results=export.imagej_table,
         direction_table=export.direction_table,
-        annotated_png=export.annotated_png,
+        annotated_png=export.annotated_labeled_png,
+        annotated_unlabeled_png=export.annotated_unlabeled_png,
         unit_metadata=unit_metadata,
     )
     st.caption(
         f"CSV 단위: Length={export.unit_length}, Area={export.unit_area}. "
         "Mean·Min·Max는 ImageJ와 같은 두께선 위 8-bit 명암값입니다."
     )
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
     d1.download_button(
-        "ImageJ 형식 CSV",
-        export.imagej_table.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"{stem}_ImageJ_results.csv",
-        mime="text/csv",
-        use_container_width=True,
+        "ImageJ 형식 CSV", export.imagej_table.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{stem}_ImageJ_results.csv", mime="text/csv", use_container_width=True,
         help="label, Area, Mean, Min, Max, Angle, Length 순서로 저장합니다.",
     )
     d2.download_button(
-        "라벨·두께 표시 이미지",
-        export.annotated_png,
-        file_name=f"{stem}_labeled_thickness.png",
-        mime="image/png",
-        use_container_width=True,
-        help="하단 정보 영역을 제외한 SEM 본문에 최종 두께선과 연속 라벨을 표시합니다.",
+        "라벨 포함 이미지", export.annotated_labeled_png,
+        file_name=f"{stem}_labeled_thickness.png", mime="image/png", use_container_width=True,
+        help="최종 두께선과 연속 라벨을 함께 표시합니다.",
     )
     d3.download_button(
-        "전체 검토 결과 ZIP",
-        zip_bytes,
-        file_name=f"{stem}_visionflux_review.zip",
-        mime="application/zip",
-        use_container_width=True,
-        help="ImageJ CSV, 방향 매칭 CSV, 표시 이미지, 수정 기록과 원본 분석표를 함께 저장합니다.",
+        "라벨 없는 이미지", export.annotated_unlabeled_png,
+        file_name=f"{stem}_thickness.png", mime="image/png", use_container_width=True,
+        help="최종 두께선만 표시하고 라벨은 숨깁니다.",
     )
+    d4.download_button(
+        "전체 결과 ZIP", zip_bytes, file_name=f"{stem}_visionflux_review.zip",
+        mime="application/zip", use_container_width=True,
+        help="ImageJ CSV, 방향 CSV, 두 종류의 표시 이미지, 수정 기록을 함께 저장합니다.",
+    )
+
+    if item.collaboration_image_id:
+        st.divider()
+        c1, c2 = st.columns(2)
+        if c1.button(
+            "공유 프로젝트에 지금 저장", key=f"shared-save-{item.item_id}",
+            use_container_width=True, disabled=not item.collaboration_editable,
+        ):
+            try:
+                _save_shared_item(item, status="in_progress")
+                _upload_shared_artifacts(item, export, zip_bytes)
+                st.success("Supabase에 스냅샷과 결과 파일을 저장했습니다.")
+            except Exception as exc:
+                st.error(f"공유 저장 실패: {type(exc).__name__}: {exc}")
+        if c2.button(
+            "작업 완료 및 잠금 해제", key=f"shared-done-{item.item_id}",
+            use_container_width=True, disabled=not item.collaboration_editable, type="primary",
+        ):
+            try:
+                _save_shared_item(item, status="done")
+                _upload_shared_artifacts(item, export, zip_bytes)
+                repo = _collaboration_repo()
+                if repo is not None:
+                    repo.release_lock(item.collaboration_image_id, item.collaboration_worker or "", completed=True)
+                item.collaboration_editable = False
+                st.success("완료 처리하고 잠금을 해제했습니다.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"완료 처리 실패: {type(exc).__name__}: {exc}")
 
 
 def _orientation_tab(item: ReviewItem) -> None:
@@ -667,6 +910,52 @@ def _orientation_tab(item: ReviewItem) -> None:
         config={"displayModeBar": False},
     )
 
+    st.markdown("### 두께·방향·개수")
+    use_nm = item.nm_per_px is not None
+    g1, g2 = st.tabs(["3D 그래프", "2D Heatmap"])
+    with g1:
+        st.plotly_chart(
+            build_thickness_direction_3d(representative_lines, use_nm=use_nm),
+            use_container_width=True,
+            config={"displayModeBar": True, "scrollZoom": True},
+        )
+    with g2:
+        st.plotly_chart(
+            build_thickness_direction_heatmap(representative_lines, use_nm=use_nm),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
+
+
+def _collaboration_tab(item: ReviewItem) -> None:
+    config = _collaboration_config()
+    if config is None:
+        st.info("Streamlit Secrets에 Supabase 설정을 추가하면 공동 작업 현황이 표시됩니다.")
+        return
+    repo = _collaboration_repo()
+    if repo is None:
+        st.warning("Supabase 연결을 만들지 못했습니다.")
+        return
+    if st.button("현황 새로고침", key="collab-main-refresh"):
+        try:
+            _refresh_shared_images(repo)
+        except Exception as exc:
+            st.error(f"새로고침 실패: {type(exc).__name__}: {exc}")
+    rows = list(st.session_state.collab_images or [])
+    if rows:
+        table = pd.DataFrame([{
+            "이미지": row.get("image_name"),
+            "상태": row.get("status"),
+            "작업자": row.get("locked_by") or "",
+            "업데이트": row.get("updated_at"),
+        } for row in rows])
+        st.dataframe(table, use_container_width=True, hide_index=True)
+    else:
+        st.caption("공유 이미지가 없습니다.")
+    if item.collaboration_image_id:
+        mode = "편집 가능" if item.collaboration_editable else "읽기 전용"
+        st.info(f"현재 이미지: {item.analysis.image_name} · {mode} · 작업자 {item.collaboration_worker or '—'}")
+
 
 def main() -> None:
     st.set_page_config(
@@ -683,6 +972,9 @@ def main() -> None:
 
     _sidebar()
     _batch_report_banner()
+    if st.session_state.collab_notice:
+        st.info(st.session_state.collab_notice)
+        st.session_state.collab_notice = None
     item = _current_item()
     if item is None:
         st.info("왼쪽에서 SEM 이미지를 올린 뒤 **분석 시작**을 눌러 주세요.")
@@ -690,11 +982,13 @@ def main() -> None:
 
     _image_info_panel(item)
     _summary_metrics(item)
-    thickness_tab, orientation_tab = st.tabs(["두께", "방향"])
+    thickness_tab, orientation_tab, collaboration_tab = st.tabs(["두께", "방향", "공동 작업"])
     with thickness_tab:
         _thickness_tab(item)
     with orientation_tab:
         _orientation_tab(item)
+    with collaboration_tab:
+        _collaboration_tab(item)
 
 
 if __name__ == "__main__":
