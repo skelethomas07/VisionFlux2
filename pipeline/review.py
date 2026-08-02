@@ -321,6 +321,7 @@ def build_session_zip(
     imagej_results: pd.DataFrame | None = None,
     direction_table: pd.DataFrame | None = None,
     annotated_png: bytes | None = None,
+    annotated_unlabeled_png: bytes | None = None,
     unit_metadata: dict | None = None,
 ) -> bytes:
     stem = image_name.rsplit(".", 1)[0]
@@ -355,6 +356,8 @@ def build_session_zip(
             )
         if annotated_png is not None:
             archive.writestr(f"{stem}_labeled_thickness.png", annotated_png)
+        if annotated_unlabeled_png is not None:
+            archive.writestr(f"{stem}_thickness.png", annotated_unlabeled_png)
         if unit_metadata is not None:
             archive.writestr(
                 f"{stem}_measurement_units.json",
@@ -403,12 +406,19 @@ def apply_canvas_edits(
         if not np.isfinite(metrics["analysis_width_px"]) or metrics["analysis_width_px"] <= 0:
             continue
         measurement_id = f"manual-{uuid.uuid4().hex[:12]}"
-        region_id = _manual_region_id()
+        region_id = str(item.get("fiber_region_id") or _manual_region_id())
         chord_direction = np.rad2deg(np.arctan2(-(y2 - y1), x2 - x1))
         tangent_direction = float((chord_direction + 180.0) % 180.0 - 90.0)
+        try:
+            supplied_direction = float(item.get("direction_deg"))
+            if np.isfinite(supplied_direction):
+                tangent_direction = supplied_direction
+        except (TypeError, ValueError):
+            pass
         row = {
             "measurement_id": measurement_id,
             "fiber_region_id": region_id,
+            "fiber_path_id": item.get("fiber_path_id"),
             "region_sample_index": 0,
             "x1": x1,
             "y1": y1,
@@ -440,6 +450,8 @@ def apply_canvas_edits(
             "action": "manual_add",
             "measurement_id": measurement_id,
             "fiber_region_id": region_id,
+            "fiber_path_id": item.get("fiber_path_id"),
+            "replacement_for": item.get("replacement_for"),
             "p1": [x1, y1],
             "p2": [x2, y2],
             "width_original_px": metrics["original_width_px"],

@@ -39,3 +39,19 @@ def test_direction_segment_figure_uses_length_weighted_local_directions():
     assert len(fig.data) == 1
     assert float(np.sum(fig.data[0].y)) == 25.0
     assert "구간 길이" in fig.layout.yaxis.title.text
+
+
+def test_thickness_direction_3d_counts_and_titles():
+    from ui.figures import build_thickness_direction_3d
+
+    lines = [
+        {"direction_deg": 5.0, "width_original_px": 4.0},
+        {"direction_deg": 7.0, "width_original_px": 4.2},
+        {"direction_deg": 35.0, "width_original_px": 8.0},
+    ]
+    fig = build_thickness_direction_3d(lines, use_nm=False)
+    assert len(fig.data) == 1
+    assert float(np.asarray(fig.data[0].z).sum()) == 3.0
+    assert "방향" in fig.layout.scene.xaxis.title.text
+    assert "두께" in fig.layout.scene.yaxis.title.text
+    assert "개수" in fig.layout.scene.zaxis.title.text

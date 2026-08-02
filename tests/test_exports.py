@@ -51,3 +51,13 @@ def test_calibrated_export_uses_original_coordinates_and_nm_units():
     assert bundle.unit_length == "nm"
     assert bundle.unit_area == "nm^2"
     assert Image.open(BytesIO(bundle.annotated_png)).size == (100, 100)
+
+
+def test_export_bundle_contains_labeled_and_unlabeled_images():
+    image = np.full((40, 40), 120, np.uint8)
+    lines = [{"label": 7, "x1": 8.0, "y1": 8.0, "x2": 20.0, "y2": 8.0, "source": "auto"}]
+    bundle = build_export_bundle(image, lines, analysis_scale=1.0, nm_per_px=None)
+    assert bundle.annotated_labeled_png.startswith(b"\x89PNG")
+    assert bundle.annotated_unlabeled_png.startswith(b"\x89PNG")
+    assert bundle.annotated_labeled_png != bundle.annotated_unlabeled_png
+    assert bundle.annotated_png == bundle.annotated_labeled_png
