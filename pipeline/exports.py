@@ -16,9 +16,15 @@ from skimage.measure import profile_line
 class ExportBundle:
     imagej_table: pd.DataFrame
     direction_table: pd.DataFrame
-    annotated_png: bytes
+    annotated_labeled_png: bytes
+    annotated_unlabeled_png: bytes
     unit_length: str
     unit_area: str
+
+    @property
+    def annotated_png(self) -> bytes:
+        """Backward-compatible alias for the labeled image."""
+        return self.annotated_labeled_png
 
 
 def _active_lines(lines: Iterable[dict]) -> list[dict]:
@@ -142,6 +148,7 @@ def render_annotated_image(
     lines: Iterable[dict],
     *,
     coordinate_scale: float = 1.0,
+    show_labels: bool = True,
 ) -> bytes:
     arr = np.asarray(image)
     if arr.ndim == 2:
@@ -164,12 +171,13 @@ def render_annotated_image(
         radius = 3
         for x, y in (p1, p2):
             draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
-        mx, my = 0.5 * (p1[0] + p2[0]), 0.5 * (p1[1] + p2[1])
-        text = str(label)
-        bbox = draw.textbbox((mx, my), text, font=font, stroke_width=2)
-        pad = 2
-        draw.rectangle((bbox[0]-pad, bbox[1]-pad, bbox[2]+pad, bbox[3]+pad), fill=(0, 0, 0))
-        draw.text((mx, my), text, fill=(255, 255, 255), font=font)
+        if show_labels:
+            mx, my = 0.5 * (p1[0] + p2[0]), 0.5 * (p1[1] + p2[1])
+            text = str(label)
+            bbox = draw.textbbox((mx, my), text, font=font, stroke_width=2)
+            pad = 2
+            draw.rectangle((bbox[0]-pad, bbox[1]-pad, bbox[2]+pad, bbox[3]+pad), fill=(0, 0, 0))
+            draw.text((mx, my), text, fill=(255, 255, 255), font=font)
 
     buffer = BytesIO()
     pil.save(buffer, format="PNG", optimize=True)
@@ -191,13 +199,15 @@ def build_export_bundle(
         nm_per_px=nm_per_px,
         image_coordinates_are_original=image_coordinates_are_original,
     )
+    coordinate_scale = 1.0 / float(analysis_scale) if image_coordinates_are_original else 1.0
     return ExportBundle(
         imagej_table=imagej,
         direction_table=direction,
-        annotated_png=render_annotated_image(
-            image,
-            lines,
-            coordinate_scale=(1.0 / float(analysis_scale) if image_coordinates_are_original else 1.0),
+        annotated_labeled_png=render_annotated_image(
+            image, lines, coordinate_scale=coordinate_scale, show_labels=True,
+        ),
+        annotated_unlabeled_png=render_annotated_image(
+            image, lines, coordinate_scale=coordinate_scale, show_labels=False,
         ),
         unit_length=unit_length,
         unit_area=unit_area,
