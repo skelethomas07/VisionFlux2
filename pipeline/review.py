@@ -317,6 +317,11 @@ def build_session_zip(
     representatives: pd.DataFrame,
     feedback: list[dict],
     analysis_summary: dict | None = None,
+    *,
+    imagej_results: pd.DataFrame | None = None,
+    direction_table: pd.DataFrame | None = None,
+    annotated_png: bytes | None = None,
+    unit_metadata: dict | None = None,
 ) -> bytes:
     stem = image_name.rsplit(".", 1)[0]
     buffer = BytesIO()
@@ -337,6 +342,23 @@ def build_session_zip(
             archive.writestr(
                 f"{stem}_analysis_summary.json",
                 json.dumps(analysis_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+            )
+        if imagej_results is not None:
+            archive.writestr(
+                f"{stem}_ImageJ_results.csv",
+                imagej_results.to_csv(index=False).encode("utf-8-sig"),
+            )
+        if direction_table is not None:
+            archive.writestr(
+                f"{stem}_fiber_directions.csv",
+                direction_table.to_csv(index=False).encode("utf-8-sig"),
+            )
+        if annotated_png is not None:
+            archive.writestr(f"{stem}_labeled_thickness.png", annotated_png)
+        if unit_metadata is not None:
+            archive.writestr(
+                f"{stem}_measurement_units.json",
+                json.dumps(unit_metadata, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
             )
     return buffer.getvalue()
 
@@ -466,6 +488,15 @@ def build_representative_lines(
         choice = group.assign(_rank=distance - 0.05 * confidence).sort_values("_rank").iloc[0]
         source = str(choice.get("source", "auto"))
         erase_ids = group["measurement_id"].astype(str).tolist()
+        ordered_path = _ordered_group(group)
+        path_points = [
+            [float(x), float(y)]
+            for x, y in zip(
+                pd.to_numeric(ordered_path.get("center_x"), errors="coerce"),
+                pd.to_numeric(ordered_path.get("center_y"), errors="coerce"),
+            )
+            if np.isfinite(x) and np.isfinite(y)
+        ]
         lines.append({
             "id": f"rep-{region}-{rep.get('subregion_id', 1)}",
             "measurement_id": str(choice.get("measurement_id")),
@@ -481,5 +512,14 @@ def build_representative_lines(
             "direction_deg": None if not np.isfinite(float(choice.get("direction_deg", np.nan))) else float(choice.get("direction_deg")),
             "source": source,
             "erase_ids": erase_ids,
+            "path_points": path_points,
         })
+    # Visible labels are regenerated after every edit. Sorting from top to bottom and
+    # left to right guarantees there are no gaps and makes exports reproducible.
+    lines.sort(key=lambda line: (
+        0.5 * (float(line["y1"]) + float(line["y2"])),
+        0.5 * (float(line["x1"]) + float(line["x2"])),
+    ))
+    for label, line in enumerate(lines, start=1):
+        line["label"] = label
     return lines

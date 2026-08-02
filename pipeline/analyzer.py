@@ -15,6 +15,11 @@ import tifffile
 
 from pipeline import legacy_pipeline
 from pipeline.fast_detector import FastDetectionResult, detect_fibers_fast
+from pipeline.image_metadata import (
+    ImageQuality,
+    ScaleCalibration,
+    extract_sem_content_and_metadata,
+)
 from pipeline.orientation import (
     OrientationResult,
     analyze_orientation,
@@ -29,6 +34,11 @@ class DecodedImage:
     image: np.ndarray
     analysis_scale: float
     original_shape: tuple[int, int]
+    full_original_shape: tuple[int, int]
+    footer_start_y: int | None
+    calibration: ScaleCalibration
+    quality: ImageQuality
+    original_image: np.ndarray
 
 
 @dataclass
@@ -44,6 +54,11 @@ class AnalysisResult:
     candidates: pd.DataFrame
     diagnostic_png: bytes | None = None
     orientation: OrientationResult | None = None
+    calibration: ScaleCalibration | None = None
+    quality: ImageQuality | None = None
+    footer_start_y: int | None = None
+    full_original_shape: tuple[int, int] | None = None
+    original_image: np.ndarray | None = None
 
 
 def _load_image_bytes(data: bytes, filename: str) -> np.ndarray:
@@ -69,16 +84,35 @@ def _load_image_bytes(data: bytes, filename: str) -> np.ndarray:
     return arr
 
 
-def decode_and_scale_image(data: bytes, filename: str, max_dimension: int | None = None) -> DecodedImage:
+def decode_and_scale_image(
+    data: bytes,
+    filename: str,
+    max_dimension: int | None = None,
+    *,
+    auto_calibrate: bool = True,
+) -> DecodedImage:
     raw = _load_image_bytes(data, filename)
-    original_shape = (int(raw.shape[0]), int(raw.shape[1]))
+    full_original_shape = (int(raw.shape[0]), int(raw.shape[1]))
+    metadata = extract_sem_content_and_metadata(raw, auto_calibrate=auto_calibrate)
+    content = np.asarray(metadata.content, np.float32)
+    original_display = _display_uint8(content)
+    original_shape = (int(content.shape[0]), int(content.shape[1]))
     longest = max(original_shape)
     scale = 1.0
     if max_dimension is not None and max_dimension > 0 and longest > max_dimension:
         scale = float(max_dimension) / float(longest)
-        target = (max(1, round(raw.shape[0] * scale)), max(1, round(raw.shape[1] * scale)))
-        raw = resize(raw, target, order=1, mode="reflect", anti_aliasing=True, preserve_range=True).astype(np.float32)
-    return DecodedImage(raw.astype(np.float32), scale, original_shape)
+        target = (max(1, round(content.shape[0] * scale)), max(1, round(content.shape[1] * scale)))
+        content = resize(content, target, order=1, mode="reflect", anti_aliasing=True, preserve_range=True).astype(np.float32)
+    return DecodedImage(
+        content.astype(np.float32),
+        scale,
+        original_shape,
+        full_original_shape,
+        metadata.footer_start_y,
+        metadata.calibration,
+        metadata.quality,
+        original_display,
+    )
 
 
 def _add_scaled_width_columns(df: pd.DataFrame, analysis_scale: float, nm_per_px: float | None) -> pd.DataFrame:
@@ -235,6 +269,7 @@ def run_uploaded_analysis(
     prefer_gpu: bool = True,
     progress_callback: Callable[[float, str], None] | None = None,
     fallback_to_legacy: bool = False,
+    auto_calibrate: bool = True,
 ) -> AnalysisResult:
     """Analyze one uploaded SEM image with the fast direction-graph detector.
 
@@ -243,7 +278,14 @@ def run_uploaded_analysis(
     only through ``fallback_to_legacy=True``.
     """
     _emit_progress(progress_callback, 0.0, "이미지 읽는 중")
-    decoded = decode_and_scale_image(data, filename, max_dimension=max_dimension)
+    decoded = decode_and_scale_image(
+        data, filename, max_dimension=max_dimension, auto_calibrate=auto_calibrate
+    )
+    effective_nm_per_px = (
+        float(nm_per_px)
+        if nm_per_px is not None
+        else decoded.calibration.nm_per_px
+    )
     analysis_img = decoded.image.astype(np.float32, copy=False)
     _emit_progress(progress_callback, 0.06, "분석 이미지 준비")
 
@@ -270,7 +312,7 @@ def run_uploaded_analysis(
         used_legacy = True
         _emit_progress(progress_callback, 0.10, "고속 검출 실패 · 기존 검출기로 전환")
         summary, local, regions, reps, candidates, analysis_img, diagnostic = _run_legacy_fallback(
-            decoded, filename, nm_per_px,
+            decoded, filename, effective_nm_per_px,
         )
         orientation = analyze_orientation(
             analysis_img,
@@ -280,7 +322,7 @@ def run_uploaded_analysis(
 
     _emit_progress(progress_callback, 0.93, "두께와 방향 결과 정리")
     local, regions, reps = normalize_analysis_tables(
-        local, regions, reps, decoded.analysis_scale, nm_per_px,
+        local, regions, reps, decoded.analysis_scale, effective_nm_per_px,
     )
     local = annotate_measurement_directions(local, orientation)
 
@@ -291,7 +333,25 @@ def run_uploaded_analysis(
         original_height=decoded.original_shape[0],
         original_width=decoded.original_shape[1],
         analysis_scale=decoded.analysis_scale,
-        nm_per_original_px=nm_per_px,
+        nm_per_original_px=effective_nm_per_px,
+        calibration_source=(
+            "manual" if nm_per_px is not None
+            else ("footer_ocr" if decoded.calibration.detected else "pixels")
+        ),
+        scale_bar_detected=bool(decoded.calibration.detected),
+        scale_bar_value=decoded.calibration.scale_value,
+        scale_bar_unit=decoded.calibration.scale_unit,
+        scale_bar_length_px=decoded.calibration.bar_length_px,
+        scale_bar_confidence=decoded.calibration.confidence,
+        footer_start_y=decoded.footer_start_y,
+        footer_removed_px=(decoded.full_original_shape[0] - decoded.original_shape[0]),
+        full_original_height=decoded.full_original_shape[0],
+        full_original_width=decoded.full_original_shape[1],
+        image_quality=decoded.quality.label,
+        quality_messages=list(decoded.quality.messages),
+        quality_sharpness=decoded.quality.sharpness,
+        quality_contrast=decoded.quality.contrast,
+        estimated_min_fiber_width_px=decoded.quality.estimated_min_fiber_width_px,
         analysis_height=int(analysis_img.shape[0]),
         analysis_width=int(analysis_img.shape[1]),
         legacy_fallback_used=bool(used_legacy),
@@ -308,6 +368,11 @@ def run_uploaded_analysis(
         candidates=candidates,
         diagnostic_png=diagnostic,
         orientation=orientation,
+        calibration=decoded.calibration,
+        quality=decoded.quality,
+        footer_start_y=decoded.footer_start_y,
+        full_original_shape=decoded.full_original_shape,
+        original_image=decoded.original_image,
     )
     _emit_progress(progress_callback, 1.0, "분석 완료")
     return result

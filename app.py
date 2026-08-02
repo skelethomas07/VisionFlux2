@@ -13,6 +13,7 @@ import streamlit as st
 from pipeline.analyzer import AnalysisResult, run_uploaded_analysis
 from pipeline.batch import BatchInput, BatchProgress, format_elapsed, run_batch
 from pipeline.compute import detect_compute_backend
+from pipeline.exports import build_export_bundle
 from pipeline.review import (
     apply_canvas_edits,
     build_representative_lines,
@@ -44,6 +45,7 @@ def _cached_analysis(
     nm_per_px: float | None,
     max_dimension: int | None,
     prefer_gpu: bool,
+    auto_calibrate: bool,
     _progress_callback=None,
 ) -> AnalysisResult:
     return run_uploaded_analysis(
@@ -53,6 +55,7 @@ def _cached_analysis(
         max_dimension=max_dimension,
         prefer_gpu=prefer_gpu,
         progress_callback=_progress_callback,
+        auto_calibrate=auto_calibrate,
     )
 
 
@@ -169,6 +172,7 @@ def _run_batch_analysis(
     max_dimension: int | None,
     prefer_gpu: bool,
     recipient: str,
+    auto_calibrate: bool,
 ) -> None:
     batch_inputs = _make_batch_inputs(uploaded_files)
     if not batch_inputs:
@@ -199,6 +203,7 @@ def _run_batch_analysis(
             nm_per_px,
             max_dimension,
             prefer_gpu,
+            auto_calibrate,
             _progress_callback=report,
         )
         report(1.0, "결과 준비 완료")
@@ -215,10 +220,11 @@ def _run_batch_analysis(
             failed_names.append(outcome.filename)
             errors[outcome.filename] = outcome.error or "알 수 없는 오류"
             continue
+        detected_nm_per_px = outcome.result.summary.get("nm_per_original_px")
         review_items[outcome.item_id] = build_review_item(
             outcome.item_id,
             outcome.result,
-            nm_per_px=nm_per_px,
+            nm_per_px=(None if detected_nm_per_px is None else float(detected_nm_per_px)),
             duration_seconds=outcome.duration_seconds,
         )
 
@@ -262,19 +268,27 @@ def _sidebar() -> None:
         help="주소를 입력하면 모든 이미지 분석이 끝난 뒤 한 번만 완료 메일을 보냅니다. 비워 두면 발송하지 않습니다.",
     ).strip()
 
-    use_calibration = st.sidebar.toggle(
-        "nm 단위 사용",
-        value=False,
-        help="업로드한 이미지들이 같은 원본 픽셀 크기(nm/px)를 사용할 때 켭니다.",
+    with st.sidebar.expander("이미지 품질 안내", expanded=False):
+        st.caption(
+            "분석 영역의 긴 변은 1200px 이상을 권장합니다. 가장 얇은 fiber가 "
+            "최소 6px, 가능하면 8px 이상으로 보여야 edge 측정이 안정적입니다."
+        )
+
+    scale_mode = st.sidebar.radio(
+        "길이 단위",
+        ["스케일바 자동 감지", "nm/px 직접 입력", "픽셀 단위"],
+        index=0,
+        help="하단 정보 영역은 fiber 분석에서 제외합니다. 자동 감지는 스케일바와 옆 단위를 읽어 nm/px를 계산합니다.",
     )
+    auto_calibrate = scale_mode == "스케일바 자동 감지"
     nm_per_px = None
-    if use_calibration:
+    if scale_mode == "nm/px 직접 입력":
         nm_per_px = st.sidebar.number_input(
             "원본 이미지 nm/px",
             min_value=0.000001,
             value=1.0,
             format="%.6f",
-            help="스케일 바 또는 촬영 조건에서 확인한 원본 이미지의 nm/px 값입니다.",
+            help="스케일바로 확인한 원본 이미지의 nm/px 값입니다.",
         )
 
     with st.sidebar.expander("분석 설정", expanded=False):
@@ -322,6 +336,7 @@ def _sidebar() -> None:
                 max_dimension,
                 prefer_gpu,
                 recipient,
+                auto_calibrate,
             )
             st.rerun()
         except Exception as exc:
@@ -370,6 +385,81 @@ def _batch_report_banner() -> None:
         st.info("분석 결과는 저장되었습니다. 완료 메일을 보내려면 Streamlit Secrets에 발신 Gmail을 설정하세요.")
     elif status == "failed":
         st.warning(f"분석은 완료됐지만 이메일 발송에 실패했습니다: {report.get('email_error')}")
+
+
+def _set_item_calibration(item: ReviewItem, nm_per_px: float | None) -> None:
+    item.nm_per_px = None if nm_per_px is None else float(nm_per_px)
+    if "width_original_px" in item.measurements.columns:
+        values = pd.to_numeric(item.measurements["width_original_px"], errors="coerce")
+        item.measurements["width_nm"] = (
+            np.nan if item.nm_per_px is None else values * item.nm_per_px
+        )
+    item.revision += 1
+    recompute_review_item(item)
+
+
+def _image_info_panel(item: ReviewItem) -> None:
+    analysis = item.analysis
+    quality = analysis.quality
+    summary = analysis.summary
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "이미지 품질",
+        quality.label if quality is not None else "—",
+        help="해상도, 선명도, 대비와 포화 픽셀을 종합한 안내값입니다. 측정 합격/불합격 판정은 아닙니다.",
+    )
+    removed = int(summary.get("footer_removed_px", 0) or 0)
+    c2.metric(
+        "분석 제외 하단",
+        f"{removed}px" if removed else "없음",
+        help="배율, 전압, 날짜와 스케일바가 있는 하단 정보 영역은 fiber 검출에서 제외됩니다.",
+    )
+    scale_text = "픽셀 단위" if item.nm_per_px is None else f"{item.nm_per_px:.6f} nm/px"
+    c3.metric(
+        "길이 보정",
+        scale_text,
+        help="자동 스케일바 인식값 또는 사용자가 수정한 원본 이미지 기준 nm/px입니다.",
+    )
+
+    with st.expander("화질과 스케일 확인", expanded=False):
+        if quality is not None:
+            st.write(
+                f"분석 영역: {quality.width_px}×{quality.height_px}px · "
+                f"대비 {quality.contrast:.2f} · 선명도 {quality.sharpness:.1f}"
+            )
+            if quality.estimated_min_fiber_width_px is not None:
+                st.write(f"추정 최소 구조 폭: 약 {quality.estimated_min_fiber_width_px:.1f}px")
+            for message in quality.messages:
+                st.warning(message)
+            if not quality.messages:
+                st.success("권장 해상도·선명도·대비 조건을 대체로 만족합니다.")
+
+        calibration = analysis.calibration
+        if calibration is not None and calibration.bar_length_px is not None:
+            label = (
+                f"{calibration.scale_value:g} {calibration.scale_unit}"
+                if calibration.scale_value is not None and calibration.scale_unit
+                else "단위 인식 실패"
+            )
+            st.write(
+                f"스케일바 감지 길이: {calibration.bar_length_px:.1f}px · "
+                f"표시값: {label} · 신뢰도 {calibration.confidence:.2f}"
+            )
+        corrected = st.number_input(
+            "이 이미지의 원본 nm/px",
+            min_value=0.000001,
+            value=float(item.nm_per_px or 1.0),
+            format="%.6f",
+            key=f"calibration-{item.item_id}",
+            help="자동 감지값이 틀렸다면 수정한 뒤 아래 버튼을 누르세요.",
+        )
+        a, b = st.columns(2)
+        if a.button("보정값 반영", key=f"apply-cal-{item.item_id}", use_container_width=True):
+            _set_item_calibration(item, float(corrected))
+            st.rerun()
+        if b.button("픽셀 단위로 전환", key=f"clear-cal-{item.item_id}", use_container_width=True):
+            _set_item_calibration(item, None)
+            st.rerun()
 
 
 def _summary_metrics(item: ReviewItem) -> None:
@@ -444,6 +534,7 @@ def _thickness_tab(item: ReviewItem) -> None:
         nm_per_px=item.nm_per_px,
         revision=item.revision,
         key=f"visionflux-canvas-{item.item_id}",
+        autosave_key=f"{item.item_id}-{analysis.image_name}",
     )
     _handle_canvas_result(canvas_result, item)
 
@@ -456,29 +547,60 @@ def _thickness_tab(item: ReviewItem) -> None:
     )
 
     stem = Path(analysis.image_name).stem
+    export_image = analysis.original_image if analysis.original_image is not None else analysis.image
+    export = build_export_bundle(
+        export_image,
+        representative_lines,
+        analysis_scale=analysis.analysis_scale,
+        nm_per_px=item.nm_per_px,
+        image_coordinates_are_original=analysis.original_image is not None,
+    )
+    unit_metadata = {
+        "Length": export.unit_length,
+        "Area": export.unit_area,
+        "Mean_Min_Max": "8-bit grayscale intensity along the 1-pixel thickness line",
+        "Angle": "ImageJ-style signed angle of the thickness line",
+        "label": "continuous visible VisionFlux fiber label after corrections",
+    }
     zip_bytes = build_session_zip(
         analysis.image_name,
         item.measurements,
         reps,
         item.feedback,
         analysis_summary=analysis.summary,
+        imagej_results=export.imagej_table,
+        direction_table=export.direction_table,
+        annotated_png=export.annotated_png,
+        unit_metadata=unit_metadata,
     )
-    d1, d2 = st.columns(2)
+    st.caption(
+        f"CSV 단위: Length={export.unit_length}, Area={export.unit_area}. "
+        "Mean·Min·Max는 ImageJ와 같은 두께선 위 8-bit 명암값입니다."
+    )
+    d1, d2, d3 = st.columns(3)
     d1.download_button(
-        "두께 분포 CSV",
-        reps.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"{stem}_fiber_thickness_distribution.csv",
+        "ImageJ 형식 CSV",
+        export.imagej_table.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{stem}_ImageJ_results.csv",
         mime="text/csv",
         use_container_width=True,
-        help="3D 구조 생성에 사용할 fiber 영역별 대표 두께와 가중치를 저장합니다.",
+        help="label, Area, Mean, Min, Max, Angle, Length 순서로 저장합니다.",
     )
     d2.download_button(
-        "검토 결과 ZIP",
+        "라벨·두께 표시 이미지",
+        export.annotated_png,
+        file_name=f"{stem}_labeled_thickness.png",
+        mime="image/png",
+        use_container_width=True,
+        help="하단 정보 영역을 제외한 SEM 본문에 최종 두께선과 연속 라벨을 표시합니다.",
+    )
+    d3.download_button(
+        "전체 검토 결과 ZIP",
         zip_bytes,
         file_name=f"{stem}_visionflux_review.zip",
         mime="application/zip",
         use_container_width=True,
-        help="수정된 측정, 대표 두께, 수정 기록과 분석 요약을 함께 저장합니다.",
+        help="ImageJ CSV, 방향 매칭 CSV, 표시 이미지, 수정 기록과 원본 분석표를 함께 저장합니다.",
     )
 
 
@@ -566,6 +688,7 @@ def main() -> None:
         st.info("왼쪽에서 SEM 이미지를 올린 뒤 **분석 시작**을 눌러 주세요.")
         return
 
+    _image_info_panel(item)
     _summary_metrics(item)
     thickness_tab, orientation_tab = st.tabs(["두께", "방향"])
     with thickness_tab:

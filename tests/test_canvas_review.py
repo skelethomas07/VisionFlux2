@@ -62,3 +62,13 @@ def test_canvas_batch_adds_multiple_manual_lines_and_erases_region():
     assert np.allclose(sorted(manual.width_original_px), [12.0, 16.0])
     assert np.allclose(sorted(manual.width_nm), [24.0, 32.0])
     assert [event["action"] for event in events].count("manual_add") == 2
+
+
+def test_representative_lines_relabel_without_gaps_after_region_removed():
+    measurements = sample_measurements()
+    measurements.loc[measurements.fiber_region_id == 1, "status"] = "rejected"
+    reps = recompute_representatives(measurements)
+    lines = build_representative_lines(measurements, reps)
+    assert [line["label"] for line in lines] == [1]
+    assert lines[0]["fiber_region_id"] == "2"
+    assert len(lines[0]["path_points"]) == 3
