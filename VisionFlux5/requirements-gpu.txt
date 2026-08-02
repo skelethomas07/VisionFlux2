@@ -1,0 +1,4 @@
+-r requirements.txt
+# NVIDIA CUDA 12.x가 설치된 로컬 환경용입니다.
+# 다른 CUDA 버전은 https://docs.cupy.dev/ 의 설치표에 맞는 패키지로 바꾸세요.
+cupy-cuda12x>=13,<15
