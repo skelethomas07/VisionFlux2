@@ -300,3 +300,113 @@ def build_direction_segment_figure(measurements: pd.DataFrame, bins: int = 36) -
         showlegend=False,
     )
     return fig
+
+
+def thickness_direction_histogram(
+    representative_lines: list[dict],
+    *,
+    use_nm: bool = False,
+    direction_bins: int = 18,
+    thickness_bins: int = 14,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return a binned count matrix using one row per visible fiber representative."""
+    directions: list[float] = []
+    thicknesses: list[float] = []
+    for line in representative_lines or []:
+        try:
+            direction = float(line.get("direction_deg", np.nan))
+            if use_nm:
+                thickness = float(line.get("width_nm", np.nan))
+            else:
+                thickness = float(line.get("width_original_px", line.get("width_analysis_px", np.nan)))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(direction) and np.isfinite(thickness) and thickness > 0:
+            # Axial directions are represented on [-90, 90).
+            direction = float((direction + 90.0) % 180.0 - 90.0)
+            directions.append(direction)
+            thicknesses.append(thickness)
+    if not directions:
+        return (
+            np.zeros((int(direction_bins), int(thickness_bins)), dtype=float),
+            np.linspace(-90.0, 90.0, int(direction_bins) + 1),
+            np.linspace(0.0, 1.0, int(thickness_bins) + 1),
+        )
+    values = np.asarray(thicknesses, float)
+    lo = max(0.0, float(np.min(values)))
+    hi = float(np.max(values))
+    if hi <= lo:
+        hi = lo + max(1.0, abs(lo) * 0.1)
+    counts, direction_edges, thickness_edges = np.histogram2d(
+        np.asarray(directions, float),
+        values,
+        bins=[
+            np.linspace(-90.0, 90.0, int(direction_bins) + 1),
+            np.linspace(lo, hi, int(thickness_bins) + 1),
+        ],
+    )
+    return counts, direction_edges, thickness_edges
+
+
+def build_thickness_direction_3d(
+    representative_lines: list[dict],
+    *,
+    use_nm: bool = False,
+) -> go.Figure:
+    counts, direction_edges, thickness_edges = thickness_direction_histogram(
+        representative_lines, use_nm=use_nm,
+    )
+    direction_centers = 0.5 * (direction_edges[:-1] + direction_edges[1:])
+    thickness_centers = 0.5 * (thickness_edges[:-1] + thickness_edges[1:])
+    fig = go.Figure(go.Surface(
+        x=direction_centers,
+        y=thickness_centers,
+        z=counts.T,
+        colorscale="Viridis",
+        colorbar={"title": "개수"},
+        hovertemplate=(
+            "방향 %{x:.1f}°<br>두께 %{y:.2f}<br>fiber 개수 %{z:.0f}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        title="두께·방향·개수 3D 분포",
+        scene={
+            "xaxis_title": "fiber 방향 (°)",
+            "yaxis_title": "두께 (nm)" if use_nm else "두께 (원본 px)",
+            "zaxis_title": "fiber 개수",
+            "xaxis": {"range": [-90, 90]},
+        },
+        height=620,
+        margin={"l": 0, "r": 0, "t": 55, "b": 0},
+    )
+    return fig
+
+
+def build_thickness_direction_heatmap(
+    representative_lines: list[dict],
+    *,
+    use_nm: bool = False,
+) -> go.Figure:
+    counts, direction_edges, thickness_edges = thickness_direction_histogram(
+        representative_lines, use_nm=use_nm,
+    )
+    direction_centers = 0.5 * (direction_edges[:-1] + direction_edges[1:])
+    thickness_centers = 0.5 * (thickness_edges[:-1] + thickness_edges[1:])
+    fig = go.Figure(go.Heatmap(
+        x=direction_centers,
+        y=thickness_centers,
+        z=counts.T,
+        colorscale="Viridis",
+        colorbar={"title": "개수"},
+        hovertemplate=(
+            "방향 %{x:.1f}°<br>두께 %{y:.2f}<br>fiber 개수 %{z:.0f}<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        title="두께·방향 개수 Heatmap",
+        xaxis_title="fiber 방향 (°)",
+        yaxis_title="두께 (nm)" if use_nm else "두께 (원본 px)",
+        height=440,
+        margin={"l": 55, "r": 20, "t": 55, "b": 50},
+    )
+    return fig
