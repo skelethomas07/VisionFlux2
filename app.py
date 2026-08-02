@@ -334,18 +334,20 @@ def _run_batch_analysis(
         elapsed_slot.caption(f"서버 경과 시간 {format_elapsed(event.elapsed_seconds)}")
 
     def analyze(item: BatchInput, report) -> AnalysisResult:
-        report(0.01, "캐시와 이미지 확인")
-        result = _cached_analysis(
-            item.data,
-            item.filename,
-            nm_per_px,
-            max_dimension,
-            prefer_gpu,
-            auto_calibrate,
-            _progress_callback=report,
-        )
-        report(1.0, "결과 준비 완료")
-        return result
+    report(0.01, "이미지 분석 준비")
+
+    result = run_uploaded_analysis(
+        item.data,
+        item.filename,
+        nm_per_px=nm_per_px,
+        max_dimension=max_dimension,
+        prefer_gpu=prefer_gpu,
+        progress_callback=report,
+        auto_calibrate=auto_calibrate,
+    )
+
+    report(1.0, "결과 준비 완료")
+    return result
 
     outcomes = run_batch(batch_inputs, analyze, on_progress=on_progress)
     elapsed = time.perf_counter() - started_perf
