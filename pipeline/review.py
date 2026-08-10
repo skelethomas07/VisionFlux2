@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 _ACTIVE_STATUSES = {"active", "accepted"}
+_DELETE_ALL_AUTO_TOKEN = "__VISIONFLUX_DELETE_ALL_AUTO__"
 
 
 def _utc_now() -> str:
@@ -383,6 +384,21 @@ def apply_canvas_edits(
     updated = measurements.copy(deep=True)
     events: list[dict] = []
     ids = {str(value) for value in (delete_ids or [])}
+    delete_all_auto = _DELETE_ALL_AUTO_TOKEN in ids
+    ids.discard(_DELETE_ALL_AUTO_TOKEN)
+
+    if delete_all_auto and not updated.empty:
+        source = updated.get("source", pd.Series("", index=updated.index)).astype(str)
+        status = updated.get("status", pd.Series("", index=updated.index)).astype(str)
+        auto_mask = (source != "manual") & status.isin(_ACTIVE_STATUSES)
+        updated.loc[auto_mask, "status"] = "rejected"
+        updated.loc[auto_mask, "review_label"] = "auto_cleared"
+        events.append({
+            "timestamp": _utc_now(),
+            "action": "erase_all_automatic_measurements",
+            "count": int(auto_mask.sum()),
+        })
+
     if ids and not updated.empty:
         mask = updated["measurement_id"].astype(str).isin(ids)
         updated.loc[mask, "status"] = "rejected"

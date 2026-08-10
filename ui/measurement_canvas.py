@@ -99,6 +99,7 @@ _HTML = r"""
     <span class="vf-divider"></span>
     <button data-action="undo" title="마지막 추가·수정·삭제 작업을 되돌립니다.">↶ 실행 취소</button>
     <button data-action="clear" title="아직 반영하지 않은 추가·수정 두께선만 지웁니다.">임시선 지우기</button>
+    <button data-action="clear-auto" title="모델이 자동으로 만든 측정만 모두 삭제 대상으로 표시합니다. 이미 추가한 수동 측정은 유지됩니다.">자동 측정 전체 지우기 <span class="vf-q">?</span></button>
     <button data-action="fit" title="현재 선택한 섹터 또는 전체 이미지에 화면을 맞춥니다.">화면 맞춤</button>
     <button data-action="magnifier" class="active" title="커서를 따라다니는 돋보기를 켜거나 끕니다.">⌕ 돋보기 ON</button>
     <button data-action="labels" class="active" title="화면의 fiber 라벨만 숨깁니다. 데이터 라벨은 유지됩니다."># 라벨 ON</button>
@@ -173,6 +174,8 @@ export default function(component) {
   const applyButton = shell.querySelector('[data-action="apply"]');
   const magnifierButton = shell.querySelector('[data-action="magnifier"]');
   const labelsButton = shell.querySelector('[data-action="labels"]');
+  const clearAutoButton = shell.querySelector('[data-action="clear-auto"]');
+  const DELETE_ALL_AUTO_TOKEN = '__VISIONFLUX_DELETE_ALL_AUTO__';
 
   if (shell.__vfCleanup) shell.__vfCleanup();
 
@@ -320,12 +323,12 @@ export default function(component) {
   function nearestRecognized(p, threshold=22){
     let best=null;
     committed.forEach(line=>{
-      if(!isRecognized(line))return;
+      if(!isRecognized(line)||isAutoClearHidden(line))return;
       const hit=pathNearest(p.x,p.y,line); if(hit&&(!best||hit.distance<best.hit.distance))best={line,hit};
     });
     return best&&best.hit.distance<=threshold?best:null;
   }
-  function nearestCommitted(p){let best=null;committed.forEach((line,index)=>{const d=lineDistance(p.x,p.y,line);if(!best||d<best.distance)best={line,index,distance:d};});return best;}
+  function nearestCommitted(p){let best=null;committed.forEach((line,index)=>{if(isAutoClearHidden(line))return;const d=lineDistance(p.x,p.y,line);if(!best||d<best.distance)best={line,index,distance:d};});return best;}
   function widthText(line){
     const {p1,p2}=linePoints(line); const aw=Math.hypot(+p2[0]-+p1[0],+p2[1]-+p1[1]);
     const ow=line.width_original_px!=null?+line.width_original_px:aw/analysisScale;
@@ -333,6 +336,11 @@ export default function(component) {
   }
   function lineColor(line){return line.source==='manual'?'#16d9e8':(line.source==='orientation'?'#a6ecff':'#ffd54a');}
   function selectedLine(){return committed.find(line=>String(line.id)===String(selectedId))||null;}
+  function isAutoClearHidden(line){return deleted.has(DELETE_ALL_AUTO_TOKEN) && line.source!=='manual';}
+  function isLineDeleted(line){
+    const ids=Array.isArray(line.erase_ids)?line.erase_ids.map(String):[];
+    return ids.some(id=>deleted.has(id)) || isAutoClearHidden(line);
+  }
 
   function drawPathOn(context,line,color,transform,width=4){
     const pts=Array.isArray(line.path_points)?line.path_points:[]; if(pts.length<2)return;
@@ -379,7 +387,8 @@ export default function(component) {
     mctx.clearRect(0,0,magnifier.width,magnifier.height);mctx.imageSmoothingEnabled=false;mctx.drawImage(image,sx,sy,sourceSize,sourceSize,0,0,magnifier.width,magnifier.height);
     const selected=selectedLine();
     committed.forEach(line=>{
-      const ids=Array.isArray(line.erase_ids)?line.erase_ids.map(String):[];const isDeleted=ids.some(id=>deleted.has(id));const isSelected=selected&&String(line.id)===String(selected.id);
+      if(isAutoClearHidden(line))return;
+      const isDeleted=isLineDeleted(line);const isSelected=selected&&String(line.id)===String(selected.id);
       if(isSelected&&isRecognized(line))drawPathOn(mctx,line,'#00fff0',transform,5);
       drawLineOn(mctx,line,isDeleted?'#ff4856':lineColor(line),isSelected?4:2.2,transform,isDeleted,false,isSelected);
     });
@@ -393,7 +402,8 @@ export default function(component) {
     if(image.complete&&image.naturalWidth){ctx.imageSmoothingEnabled=scale<1;ctx.drawImage(image,offsetX,offsetY,image.naturalWidth*scale,image.naturalHeight*scale);}
     const selected=selectedLine();
     for(const line of committed){
-      const ids=Array.isArray(line.erase_ids)?line.erase_ids.map(String):[];const isDeleted=ids.some(id=>deleted.has(id));const isSelected=selected&&String(line.id)===String(selected.id);
+      if(isAutoClearHidden(line))continue;
+      const isDeleted=isLineDeleted(line);const isSelected=selected&&String(line.id)===String(selected.id);
       ctx.globalAlpha=selected&&!isSelected?.28:1;
       if(isSelected&&isRecognized(line))drawPath(line,'#00fff0');
       drawLine(line,isDeleted?'rgba(255,72,86,.95)':lineColor(line),isSelected?4.2:(line.source==='manual'?2.8:2.2),isDeleted,true,isSelected);
@@ -410,7 +420,11 @@ export default function(component) {
       modify:modifyTarget?'새 edge 위치를 클릭하세요':'수정할 두께선의 한쪽 끝을 클릭하세요',
       erase:'지울 두께선을 클릭하세요',
     };
-    modeLabel.textContent=editable?labels[mode]:'읽기 전용 · 이동과 선택만 가능';hint.textContent=editable?labels[mode]:'다른 작업자가 편집 중입니다';countsLabel.textContent=`임시 측정 ${pending.length}개 · 삭제 예정 ${deleted.size}개`;applyButton.disabled=!editable||(pending.length===0&&deleted.size===0);updateSectorStatus();
+    modeLabel.textContent=editable?labels[mode]:'읽기 전용 · 이동과 선택만 가능';hint.textContent=editable?labels[mode]:'다른 작업자가 편집 중입니다';
+    const autoClearPending=deleted.has(DELETE_ALL_AUTO_TOKEN);
+    countsLabel.textContent=autoClearPending?`임시 측정 ${pending.length}개 · 자동 측정 전체 삭제 예정`:`임시 측정 ${pending.length}개 · 삭제 예정 ${deleted.size}개`;
+    clearAutoButton.disabled=!editable||autoClearPending||!committed.some(line=>line.source!=='manual');
+    applyButton.disabled=!editable||(pending.length===0&&deleted.size===0);updateSectorStatus();
   }
   function setMode(next){
     if(!editable&&next!=='pan')next='pan';mode=next;firstPoint=null;normalGuide=null;modifyTarget=null;clearHover();
@@ -492,6 +506,16 @@ export default function(component) {
   shell.querySelectorAll('[data-tool]').forEach(button=>{button.disabled=!editable&&button.dataset.tool!=='pan';button.onclick=()=>setMode(button.dataset.tool);});
   shell.querySelector('[data-action="undo"]').onclick=restoreLast;
   shell.querySelector('[data-action="clear"]').onclick=()=>{if(!pending.length&&!firstPoint&&!modifyTarget)return;snapshot();pending=[];firstPoint=null;normalGuide=null;modifyTarget=null;draw();queueSave();};
+  clearAutoButton.onclick=()=>{
+    if(!editable)return;
+    const automaticCount=committed.filter(line=>line.source!=='manual').length;
+    if(!automaticCount||deleted.has(DELETE_ALL_AUTO_TOKEN))return;
+    const confirmed=window.confirm(`현재 표시된 모델 자동 측정 ${automaticCount}개를 모두 지울까요?\n사용자가 추가한 수동 측정은 유지됩니다.`);
+    if(!confirmed)return;
+    snapshot();deleted.add(DELETE_ALL_AUTO_TOKEN);
+    const selected=selectedLine();if(selected&&selected.source!=='manual')selectedId=null;
+    firstPoint=null;normalGuide=null;modifyTarget=null;draw();queueSave();
+  };
   shell.querySelector('[data-action="fit"]').onclick=fitCurrent;
   magnifierButton.onclick=()=>{magnifierEnabled=!magnifierEnabled;magnifierButton.classList.toggle('active',magnifierEnabled);magnifierButton.textContent=magnifierEnabled?'⌕ 돋보기 ON':'⌕ 돋보기 OFF';draw();queueSave();};
   labelsButton.onclick=()=>{labelsEnabled=!labelsEnabled;labelsButton.classList.toggle('active',labelsEnabled);labelsButton.textContent=labelsEnabled?'# 라벨 ON':'# 라벨 OFF';draw();queueSave();};
