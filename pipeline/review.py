@@ -319,6 +319,7 @@ def build_session_zip(
     feedback: list[dict],
     analysis_summary: dict | None = None,
     *,
+    measurement_table: pd.DataFrame | None = None,
     imagej_results: pd.DataFrame | None = None,
     direction_table: pd.DataFrame | None = None,
     annotated_png: bytes | None = None,
@@ -344,6 +345,11 @@ def build_session_zip(
             archive.writestr(
                 f"{stem}_analysis_summary.json",
                 json.dumps(analysis_summary, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+            )
+        if measurement_table is not None:
+            archive.writestr(
+                f"{stem}_measurements.csv",
+                measurement_table.to_csv(index=False).encode("utf-8-sig"),
             )
         if imagej_results is not None:
             archive.writestr(
@@ -458,7 +464,8 @@ def apply_canvas_edits(
             "bundle_score": 0.0,
             "status": "active",
             "source": "manual",
-            "review_label": "manual",
+            "review_label": "corrected" if item.get("replacement_for") not in (None, "") else "manual",
+            "replacement_for": item.get("replacement_for"),
         }
         rows.append(row)
         events.append({
@@ -539,6 +546,9 @@ def build_representative_lines(
             "width_nm": None if not np.isfinite(float(rep.get("representative_width_nm", np.nan))) else float(rep.get("representative_width_nm")),
             "direction_deg": None if not np.isfinite(float(choice.get("direction_deg", np.nan))) else float(choice.get("direction_deg")),
             "source": source,
+            "status": str(choice.get("status", "active")),
+            "review_label": str(choice.get("review_label", "")),
+            "replacement_for": choice.get("replacement_for"),
             "erase_ids": erase_ids,
             "path_points": path_points,
         })

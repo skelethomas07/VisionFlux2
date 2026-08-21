@@ -20,6 +20,7 @@ from pipeline.review import (
     build_session_zip,
 )
 from pipeline.review_state import ReviewItem, build_review_item, recompute_review_item
+from pipeline.resume import build_measurement_table, try_build_resume_analysis
 from services.collaboration import (
     CollaborationConfig,
     SupabaseRepository,
@@ -203,7 +204,7 @@ def _save_shared_item(
     return True
 
 
-def _upload_shared_artifacts(item: ReviewItem, export, zip_bytes: bytes) -> None:
+def _upload_shared_artifacts(item: ReviewItem, export, zip_bytes: bytes, measurement_table: pd.DataFrame) -> None:
     if not item.collaboration_image_id or not item.collaboration_worker:
         return
     repo = _collaboration_repo()
@@ -211,15 +212,9 @@ def _upload_shared_artifacts(item: ReviewItem, export, zip_bytes: bytes) -> None
         raise RuntimeError("Supabase 설정을 읽지 못했습니다.")
     stem = Path(item.analysis.image_name).stem
     repo.upload_artifact(
-        image_id=item.collaboration_image_id, kind="imagej_csv",
-        filename=f"{stem}_ImageJ_results.csv",
-        data=export.imagej_table.to_csv(index=False).encode("utf-8-sig"),
-        content_type="text/csv", worker_name=item.collaboration_worker,
-    )
-    repo.upload_artifact(
-        image_id=item.collaboration_image_id, kind="direction_csv",
-        filename=f"{stem}_fiber_directions.csv",
-        data=export.direction_table.to_csv(index=False).encode("utf-8-sig"),
+        image_id=item.collaboration_image_id, kind="measurement_csv",
+        filename=f"{stem}_measurements.csv",
+        data=measurement_table.to_csv(index=False).encode("utf-8-sig"),
         content_type="text/csv", worker_name=item.collaboration_worker,
     )
     repo.upload_artifact(
@@ -334,7 +329,16 @@ def _run_batch_analysis(
         elapsed_slot.caption(f"서버 경과 시간 {format_elapsed(event.elapsed_seconds)}")
 
     def analyze(item: BatchInput, report) -> AnalysisResult:
-        report(0.01, "이미지 분석 준비")
+        report(0.01, "이미지 확인")
+        resumed = try_build_resume_analysis(
+            item.data, item.filename, nm_per_px=nm_per_px,
+        )
+        if resumed is not None:
+            count = int(resumed.summary.get("imported_measurements", 0))
+            report(0.85, f"기존 측정선 {count}개 복원 · 자동 재분석 생략")
+            report(1.0, "이어하기 준비 완료")
+            return resumed
+        report(0.04, "새 SEM 이미지 분석 준비")
         result = run_uploaded_analysis(
             item.data,
             item.filename,
@@ -397,7 +401,7 @@ def _sidebar() -> None:
         "SEM 이미지",
         type=SUPPORTED_TYPES,
         accept_multiple_files=True,
-        help="한 장 또는 여러 장을 한 번에 올릴 수 있습니다. 메모리 사용량을 줄이기 위해 순서대로 분석합니다.",
+        help="새 SEM은 순서대로 분석합니다. VisionFlux 노란/청록 측정선이 들어간 완료 이미지는 자동으로 이어하기 모드로 열고 재분석하지 않습니다.",
     )
 
     recipient = st.sidebar.text_input(
@@ -731,6 +735,10 @@ def _thickness_tab(item: ReviewItem) -> None:
     reps = item.representatives
     representative_lines = build_representative_lines(item.measurements, reps)
 
+    if bool(analysis.summary.get("resume_mode")):
+        imported = int(analysis.summary.get("imported_measurements", 0))
+        st.info(f"이어하기 모드 · 기존 측정선 {imported}개를 복원했습니다. 자동 두께 탐지는 다시 실행하지 않았습니다.")
+
     with st.expander("측정값 고치는 방법", expanded=False):
         st.markdown(
             """
@@ -772,12 +780,17 @@ def _thickness_tab(item: ReviewItem) -> None:
         nm_per_px=item.nm_per_px,
         image_coordinates_are_original=analysis.original_image is not None,
     )
+    measurement_table = build_measurement_table(
+        representative_lines,
+        analysis_scale=analysis.analysis_scale,
+        image_coordinates_are_original=analysis.original_image is not None,
+    )
     unit_metadata = {
-        "Length": export.unit_length,
-        "Area": export.unit_area,
-        "Mean_Min_Max": "8-bit grayscale intensity along the 1-pixel thickness line",
-        "Angle": "ImageJ-style signed angle of the thickness line",
-        "label": "continuous visible VisionFlux fiber label after corrections",
+        "coordinates": "original image pixels",
+        "width": "original image pixels",
+        "angle": "local fiber tangent direction in degrees, axial [-90, 90)",
+        "source": "auto or manual",
+        "status": "keep, corrected, or ambiguous for visible measurements; removed measurements are omitted",
     }
     zip_bytes = build_session_zip(
         analysis.image_name,
@@ -785,21 +798,20 @@ def _thickness_tab(item: ReviewItem) -> None:
         reps,
         item.feedback,
         analysis_summary=analysis.summary,
-        imagej_results=export.imagej_table,
-        direction_table=export.direction_table,
+        measurement_table=measurement_table,
         annotated_png=export.annotated_labeled_png,
         annotated_unlabeled_png=export.annotated_unlabeled_png,
         unit_metadata=unit_metadata,
     )
     st.caption(
-        f"CSV 단위: Length={export.unit_length}, Area={export.unit_area}. "
-        "Mean·Min·Max는 ImageJ와 같은 두께선 위 8-bit 명암값입니다."
+        "CSV는 원본 이미지 픽셀 좌표를 저장합니다. "
+        "measurement_id, x1, y1, x2, y2, center_x, center_y, width, angle, source, status 순서입니다."
     )
     d1, d2, d3, d4 = st.columns(4)
     d1.download_button(
-        "ImageJ 형식 CSV", export.imagej_table.to_csv(index=False).encode("utf-8-sig"),
-        file_name=f"{stem}_ImageJ_results.csv", mime="text/csv", use_container_width=True,
-        help="label, Area, Mean, Min, Max, Angle, Length 순서로 저장합니다.",
+        "측정 데이터 CSV", measurement_table.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"{stem}_measurements.csv", mime="text/csv", use_container_width=True,
+        help="현재 화면에 남아 있는 대표 두께선을 좌표·폭·방향·출처·상태와 함께 저장합니다.",
     )
     d2.download_button(
         "라벨 포함 이미지", export.annotated_labeled_png,
@@ -814,7 +826,7 @@ def _thickness_tab(item: ReviewItem) -> None:
     d4.download_button(
         "전체 결과 ZIP", zip_bytes, file_name=f"{stem}_visionflux_review.zip",
         mime="application/zip", use_container_width=True,
-        help="ImageJ CSV, 방향 CSV, 두 종류의 표시 이미지, 수정 기록을 함께 저장합니다.",
+        help="11컬럼 측정 CSV, 두 종류의 표시 이미지, 수정 기록을 함께 저장합니다.",
     )
 
     if item.collaboration_image_id:
@@ -826,7 +838,7 @@ def _thickness_tab(item: ReviewItem) -> None:
         ):
             try:
                 _save_shared_item(item, status="in_progress")
-                _upload_shared_artifacts(item, export, zip_bytes)
+                _upload_shared_artifacts(item, export, zip_bytes, measurement_table)
                 st.success("Supabase에 스냅샷과 결과 파일을 저장했습니다.")
             except Exception as exc:
                 st.error(f"공유 저장 실패: {type(exc).__name__}: {exc}")
@@ -836,7 +848,7 @@ def _thickness_tab(item: ReviewItem) -> None:
         ):
             try:
                 _save_shared_item(item, status="done")
-                _upload_shared_artifacts(item, export, zip_bytes)
+                _upload_shared_artifacts(item, export, zip_bytes, measurement_table)
                 repo = _collaboration_repo()
                 if repo is not None:
                     repo.release_lock(item.collaboration_image_id, item.collaboration_worker or "", completed=True)
@@ -851,7 +863,10 @@ def _orientation_tab(item: ReviewItem) -> None:
     analysis = item.analysis
     orientation = analysis.orientation
     if orientation is None:
-        st.info("방향 결과가 없습니다. 이미지를 다시 분석해 주세요.")
+        if bool(analysis.summary.get("resume_mode")):
+            st.info("이어하기 모드에서는 기존 측정선을 복원하고 수동 추가만 이어가므로 방향 분석을 다시 실행하지 않습니다.")
+        else:
+            st.info("방향 결과가 없습니다. 이미지를 다시 분석해 주세요.")
         return
     representative_lines = build_representative_lines(item.measurements, item.representatives)
     status = (

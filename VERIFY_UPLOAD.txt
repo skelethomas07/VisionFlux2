@@ -1,14 +1,8 @@
-VisionFlux2 저장소 루트에 이 ZIP의 '내용 전체'를 덮어쓰세요.
+Upload these files to the existing repository paths:
 
-필수 경로:
-- app.py
-- ui/figures.py
-- ui/measurement_canvas.py
-- services/collaboration.py
-- pipeline/exports.py
+app.py                         -> repository root /app.py
+pipeline/review.py             -> /pipeline/review.py
+pipeline/resume.py             -> /pipeline/resume.py (new file)
 
-업로드 후 GitHub에서 아래 두 주소가 열리는지 확인하세요.
-- /blob/main/ui/figures.py
-- /blob/main/services/collaboration.py
-
-Streamlit Main file path: app.py
+Do not upload the outer VisionFlux-resume-csv-patch folder as a nested directory.
+After commit, reboot the Streamlit app.

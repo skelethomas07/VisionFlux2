@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from io import BytesIO
+import json
 import math
 from pathlib import Path
 from typing import Iterable
@@ -9,6 +10,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
+from PIL.PngImagePlugin import PngInfo
 from skimage.measure import profile_line
 
 
@@ -143,6 +145,24 @@ def build_imagej_results(
     return pd.DataFrame(rows), pd.DataFrame(direction_rows), unit_length, unit_area
 
 
+def _resume_metadata_rows(lines: Iterable[dict], coordinate_scale: float) -> list[dict]:
+    rows: list[dict] = []
+    for index, raw_line in enumerate(_active_lines(lines), start=1):
+        line = _scale_line(raw_line, coordinate_scale)
+        rows.append({
+            "measurement_id": str(raw_line.get("measurement_id") or raw_line.get("id") or f"measurement-{index}"),
+            "x1": float(line["x1"]),
+            "y1": float(line["y1"]),
+            "x2": float(line["x2"]),
+            "y2": float(line["y2"]),
+            "direction_deg": raw_line.get("direction_deg"),
+            "source": "manual" if str(raw_line.get("source", "auto")) == "manual" else "auto",
+            "review_label": raw_line.get("review_label"),
+            "replacement_for": raw_line.get("replacement_for"),
+        })
+    return rows
+
+
 def render_annotated_image(
     image: np.ndarray,
     lines: Iterable[dict],
@@ -180,7 +200,12 @@ def render_annotated_image(
             draw.text((mx, my), text, fill=(255, 255, 255), font=font)
 
     buffer = BytesIO()
-    pil.save(buffer, format="PNG", optimize=True)
+    pnginfo = PngInfo()
+    pnginfo.add_text(
+        "visionflux_measurements_v1",
+        json.dumps(_resume_metadata_rows(lines, coordinate_scale), ensure_ascii=False, separators=(",", ":")),
+    )
+    pil.save(buffer, format="PNG", optimize=True, pnginfo=pnginfo)
     return buffer.getvalue()
 
 
